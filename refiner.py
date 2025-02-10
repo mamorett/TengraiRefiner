@@ -53,7 +53,7 @@ def process_directory(input_dir):
         transformer=transformer,
     )
     pipe.enable_model_cpu_offload()
-    pipe.scheduler = EulerDiscreteScheduler.from_config(pipe.scheduler.config)
+    # pipe.scheduler = EulerDiscreteScheduler.from_config(pipe.scheduler.config)
 
     adapter_id = "alimama-creative/FLUX.1-Turbo-Alpha"
     pipe.load_lora_weights(adapter_id)
@@ -85,10 +85,9 @@ def process_directory(input_dir):
                 print(f"Step {step} / {num_inference_steps} | Timestep: {timestep}")  # Debugging output
                 return {"latents": latents} if latents is not None else {}  # Ensure a valid return type
 
-            num_inference_steps = 10
-            # Manually set timesteps and sigmas
-            pipe.scheduler.set_timesteps(num_inference_steps)
-            sigmas = pipe.scheduler.sigmas  # Extract sigmas
+            # Set the timesteps and sigmas
+            num_inference_steps = 50
+
             with tqdm(total=num_inference_steps, desc=f"Steps for {filename}", leave=True) as step_pbar:
                 callback.step_pbar = step_pbar
 
@@ -100,7 +99,6 @@ def process_directory(input_dir):
                     guidance_scale=3.5,
                     height=height,
                     width=width,
-                    sigmas=sigmas,  # Explicitly set sigmas
                     callback_on_step_end=callback
                 ).images[0]
 
