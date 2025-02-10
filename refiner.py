@@ -2,20 +2,16 @@ from dotenv import load_dotenv
 import os
 import torch
 from PIL import Image
-from diffusers import FluxPipeline
-from safetensors.torch import load_file
+from diffusers import FluxImg2ImgPipeline
 from tqdm import tqdm
-from huggingface_hub import hf_hub_download
-import gc  # For manual garbage collection
 import datetime
-from datetime import timezone
-from multiformats import multihash
-from optimum.quanto import freeze, qfloat8, quantize
+from transformers import CLIPTextModel, CLIPTokenizer, T5EncoderModel, T5TokenizerFast
 from diffusers import FlowMatchEulerDiscreteScheduler, AutoencoderKL
 from diffusers.models.transformers.transformer_flux import FluxTransformer2DModel
-from diffusers.pipelines.flux.pipeline_flux import FluxPipeline
-from diffusers import FluxImg2ImgPipeline
-from transformers import CLIPTextModel, CLIPTokenizer, T5EncoderModel, T5TokenizerFast
+from optimum.quanto import freeze, qfloat8, quantize
+from diffusers import EulerDiscreteScheduler
+
+
 
 # Load environment variables
 load_dotenv()
@@ -43,22 +39,10 @@ print(datetime.datetime.now(), "Quantizing text encoder 2")
 quantize(text_encoder_2, weights=qfloat8)
 freeze(text_encoder_2)
 
-
-# # Function to load model weights lazily to reduce memory footprint
-# def load_model_weights(model_path):
-#     return load_file(model_path)
-
-# Load the Flux model pipeline
 def process_directory(input_dir):
     output_dir = os.path.join(input_dir, "FluxSchnell")
     os.makedirs(output_dir, exist_ok=True)
-    
-    # model_path = os.getenv('FLUX_MODEL_PATH')
-    # if not model_path:
-    #     raise ValueError("FLUX_MODEL_PATH not set in .env file")
-        
-    # print(f"Loading Flux model from {model_path}...")
-    # pipe = FluxPipeline.from_single_file(model_path).to(device, dtype=dtype)
+
     pipe = FluxImg2ImgPipeline(
         scheduler=scheduler,
         text_encoder=text_encoder,
@@ -68,53 +52,60 @@ def process_directory(input_dir):
         vae=vae,
         transformer=transformer,
     )
-    pipe.enable_model_cpu_offload()    
-    
-    # Load LoRA weights and set the LoRA scale to exactly 0.125
-    # repo_name = "ByteDance/Hyper-SD"
-    # ckpt_name = "Hyper-FLUX.1-dev-8steps-lora.safetensors"
+    pipe.enable_model_cpu_offload()
+    pipe.scheduler = EulerDiscreteScheduler.from_config(pipe.scheduler.config)
+
     adapter_id = "alimama-creative/FLUX.1-Turbo-Alpha"
-
     pipe.load_lora_weights(adapter_id)
-    pipe.fuse_lora(lora_scale=1)    
+    pipe.fuse_lora(lora_scale=1)  
 
-    # Process images one by one
     png_files = sorted([f for f in os.listdir(input_dir) if f.lower().endswith('.png')])
-    
-    for filename in tqdm(png_files, desc="Processing images", unit="img"):
-        input_path = os.path.join(input_dir, filename)
-        output_path = os.path.join(output_dir, filename)
-        
-        # Check if the output image already exists
-        if os.path.exists(output_path):
-            continue
-            
-        try:
-            # Open the input image
-            init_image = Image.open(input_path).convert("RGB")
-        except Exception as e:
-            print(f"Skipping {filename}: {e}")
-            continue
+    total_files = len(png_files)
 
-        # Progress callback during image processing
-        def callback(step, timestep, latents):
-            callback.pbar.update(1)
-            return {"latents": latents}
-        
-        num_inference_steps = 10
-        with tqdm(total=num_inference_steps, desc=f"Steps for {filename}", leave=False) as pbar:
-            callback.pbar = pbar
-            # Perform the image-to-image inference
-            result = pipe(
-                prompt="Very detailed, masterpiece quality",
-                image=init_image,
-                num_inference_steps=num_inference_steps,
-                strength=0.20,
-                guidance_scale=3.5,
-            ).images[0]         
-        
-        # Save the resulting image
-        result.save(output_path)
+    with tqdm(total=total_files, desc="Processing images", unit="img") as main_pbar:
+        for filename in png_files:
+            input_path = os.path.join(input_dir, filename)
+            output_path = os.path.join(output_dir, filename)
+
+            if os.path.exists(output_path):
+                main_pbar.update(1)
+                continue
+
+            try:
+                init_image = Image.open(input_path).convert("RGB")
+                width, height = init_image.size
+            except Exception as e:
+                print(f"Skipping {filename}: {e}")
+                main_pbar.update(1)
+                continue
+
+            def callback(pipe, step, timestep, callback_kwargs):
+                latents = callback_kwargs.get("latents", None)
+                callback.step_pbar.update(1)
+                print(f"Step {step} / {num_inference_steps} | Timestep: {timestep}")  # Debugging output
+                return {"latents": latents} if latents is not None else {}  # Ensure a valid return type
+
+            num_inference_steps = 10
+            # Manually set timesteps and sigmas
+            pipe.scheduler.set_timesteps(num_inference_steps)
+            sigmas = pipe.scheduler.sigmas  # Extract sigmas
+            with tqdm(total=num_inference_steps, desc=f"Steps for {filename}", leave=True) as step_pbar:
+                callback.step_pbar = step_pbar
+
+                result = pipe(
+                    prompt="Very detailed, masterpiece quality",
+                    image=init_image,
+                    num_inference_steps=num_inference_steps,
+                    strength=0.20,
+                    guidance_scale=3.5,
+                    height=height,
+                    width=width,
+                    sigmas=sigmas,  # Explicitly set sigmas
+                    callback_on_step_end=callback
+                ).images[0]
+
+            result.save(output_path)
+            main_pbar.update(1)
 
 if __name__ == "__main__":
     import sys
