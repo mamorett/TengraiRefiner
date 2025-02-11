@@ -9,8 +9,8 @@ from transformers import CLIPTextModel, CLIPTokenizer, T5EncoderModel, T5Tokeniz
 from diffusers import FlowMatchEulerDiscreteScheduler, AutoencoderKL
 from diffusers.models.transformers.transformer_flux import FluxTransformer2DModel
 from optimum.quanto import freeze, qfloat8, quantize
-from diffusers import EulerDiscreteScheduler
 import warnings
+from huggingface_hub import hf_hub_download
 warnings.filterwarnings('ignore')
 import argparse
 
@@ -38,7 +38,7 @@ print(datetime.datetime.now(), "Quantizing text encoder 2")
 quantize(text_encoder_2, weights=qfloat8)
 freeze(text_encoder_2)
 
-def process_directory(input_dir, output_dir):
+def process_directory(input_dir, output_dir, acceleration):
     os.makedirs(output_dir, exist_ok=True)
 
     pipe = FluxImg2ImgPipeline(
@@ -52,11 +52,16 @@ def process_directory(input_dir, output_dir):
     )
     pipe.enable_model_cpu_offload()
     pipe.set_progress_bar_config(disable=True)
-    # pipe.scheduler = EulerDiscreteScheduler.from_config(pipe.scheduler.config)
 
-    adapter_id = "alimama-creative/FLUX.1-Turbo-Alpha"
-    pipe.load_lora_weights(adapter_id)
-    pipe.fuse_lora(lora_scale=1)  
+    if acceleration == "hyper":
+        repo_name = "ByteDance/Hyper-SD"
+        ckpt_name = "Hyper-FLUX.1-dev-8steps-lora.safetensors"
+        pipe.load_lora_weights(hf_hub_download(repo_name, ckpt_name))
+        pipe.fuse_lora(lora_scale=0.125)
+    elif acceleration == "alimama":
+        adapter_id = "alimama-creative/FLUX.1-Turbo-Alpha"
+        pipe.load_lora_weights(adapter_id)
+        pipe.fuse_lora(lora_scale=1)
 
     # Get the list of PNG files in the input directory
     png_files = sorted([f for f in os.listdir(input_dir) if f.lower().endswith('.png')])
@@ -99,7 +104,10 @@ def process_directory(input_dir, output_dir):
 
                 # Set the timesteps and strength for the inference
                 strength = 0.20
-                desired_num_steps = 10
+                if acceleration == "fluxfull":
+                    desired_num_steps = 25
+                else:
+                    desired_num_steps = 10
                 # see https://huggingface.co/docs/diffusers/api/pipelines/flux#diffusers.FluxImg2ImgPipeline for more details
                 num_inference_steps = desired_num_steps / strength
 
@@ -133,12 +141,22 @@ def main():
     parser.add_argument('--output_dir', '-o', type=str,
                         help='Optional output directory. If not provided, outputs will be placed in {directory_path}/FluxSchnell.')
 
+    parser.add_argument('--acceleration', '-a', type=str,
+                        choices=['alimama', 'hyper'],
+                        default='alimama',
+                        help='Acceleration LORA. Available options are Alimama Turbo or ByteDance Hyper (alimama|hyper) with 10 steps. If not provided, flux with 25 steps will be used.')
+                  
+
     # Parse arguments
     args = parser.parse_args()
 
     # If output_dir is not provided, set it based on directory_path
     if not args.output_dir:
-        args.output_dir = os.path.join(args.directory_path, "FluxSchnell")    
+        args.output_dir = os.path.join(args.directory_path, "FluxSchnell")
+
+    # If output_dir is not provided, set it based on directory_path
+    if not args.acceleration:
+        args.acceleration = "fluxfull"          
     
     # Check if the mandatory argument is missing
     if not args.directory_path:
@@ -147,7 +165,7 @@ def main():
         return
 
     # Call your function with arguments
-    process_directory(str(args.directory_path), str(args.output_dir))
+    process_directory(str(args.directory_path), str(args.output_dir), str(args.acceleration))
 
 if __name__ == "__main__":
     main()
