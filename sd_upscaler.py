@@ -17,6 +17,7 @@ import math
 
 import gradio as gr
 from gradio_imageslider import ImageSlider
+import argparse
 
 USE_TORCH_COMPILE = False
 ENABLE_CPU_OFFLOAD = os.getenv("ENABLE_CPU_OFFLOAD", "0") == "1"
@@ -276,38 +277,48 @@ def gradio_process_image(input_image, resolution, num_inference_steps, strength,
     
     return [input_array, final_result]
 
-title = """<h1 align="center">Tile Upscaler V2</h1>
-<p align="center">Creative version of Tile Upscaler. The main ideas come from</p>
-<p><center>
-<a href="https://huggingface.co/spaces/gokaygokay/Tile-Upscaler" target="_blank">[Tile Upscaler]</a>
-<a href="https://github.com/philz1337x/clarity-upscaler" target="_blank">[philz1337x]</a>
-<a href="https://github.com/BatouResearch/controlnet-tile-upscale" target="_blank">[Pau-Lozano]</a>
-</center></p>
-"""
+def main():
+    # Create an argument parser object with a description of your program.
+    parser = argparse.ArgumentParser(description='Script for image generation')
 
-with gr.Blocks() as demo:
-    gr.HTML(title)
-    with gr.Row():
-        with gr.Column():
-            input_image = gr.Image(type="pil", label="Input Image")
-            run_button = gr.Button("Enhance Image")
-        with gr.Column():
-            output_slider = ImageSlider(label="Before / After", type="numpy")
-    with gr.Accordion("Advanced Options", open=False):
-        resolution = gr.Slider(minimum=128, maximum=2048, value=1024, step=128, label="Resolution")
-        num_inference_steps = gr.Slider(minimum=1, maximum=50, value=20, step=1, label="Number of Inference Steps")
-        strength = gr.Slider(minimum=0, maximum=1, value=0.2, step=0.01, label="Strength")
-        hdr = gr.Slider(minimum=0, maximum=1, value=0, step=0.1, label="HDR Effect")
-        guidance_scale = gr.Slider(minimum=0, maximum=20, value=6, step=0.5, label="Guidance Scale")
-        controlnet_strength = gr.Slider(minimum=0.0, maximum=2.0, value=0.75, step=0.05, label="ControlNet Strength")
-        scheduler_name = gr.Dropdown(
-            choices=["DDIM", "DPM++ 3M SDE Karras", "DPM++ 3M Karras"],
-            value="DDIM",
-            label="Scheduler"
-        )
+    # Add the input_image parameter which is mandatory
+    parser.add_argument('-i', '--input_image', required=True, help='Path to the input image.')
 
-    run_button.click(fn=gradio_process_image, 
-                     inputs=[input_image, resolution, num_inference_steps, strength, hdr, guidance_scale, controlnet_strength, scheduler_name],
-                     outputs=output_slider)
+    # Add other parameters as optional arguments that take default values if not specified.
+    parser.add_argument('-r', '--resolution', type=int, default=1024,
+                        help='Resolution of generated image (default: 1024)')
+    
+    parser.add_argument('-n', '--num_inference_steps', type=int, default=20,
+                        help='Number of inference steps for generation (default: 20)')
 
-demo.launch(debug=True, share=True)
+    parser.add_argument('-s', '--strength', type=float, default=0.2,
+                        help='Strength parameter for the generation process (default: 0.2)')
+    
+    parser.add_argument('--hdr', type=float, default=0.0,
+                        help='HDR Effect on generated image (default: 0)')
+
+    parser.add_argument('-g', '--guidance_scale', type=float, default=6.0,
+                        help='Guidance scale for the generation process (default: 6)')
+    
+    parser.add_argument('--controlnet_strength', type=float, default=0.75,
+                        help='ControlNet strength parameter (default: 0.75)')
+
+    parser.add_argument('-S', '--scheduler_name', choices=["DDIM", "DPM++ 3M SDE Karras", "DPM++ 3M Karras"],
+                        default="DDIM",
+                        help='Scheduler for the generation process (default: DDIM)')
+
+    # Parse the command line arguments
+    args = parser.parse_args()
+
+    # Now you can access your variables like this:
+    input_image_path = args.input_image
+    resolution = args.resolution
+    num_inference_steps = args.num_inference_steps
+    strength = args.strength
+    hdr = args.hdr
+    guidance_scale = args.guidance_scale
+    controlnet_strength = args.controlnet_strength
+    scheduler_name = args.scheduler_name
+
+if __name__ == "__main__":
+   main()
