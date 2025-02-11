@@ -10,11 +10,9 @@ from diffusers import FlowMatchEulerDiscreteScheduler, AutoencoderKL
 from diffusers.models.transformers.transformer_flux import FluxTransformer2DModel
 from optimum.quanto import freeze, qfloat8, quantize
 from diffusers import EulerDiscreteScheduler
+import warnings
+warnings.filterwarnings('ignore')
 
-
-
-# Load environment variables
-load_dotenv()
 
 # Enable memory-efficient attention for SD-based models
 torch.backends.cuda.enable_mem_efficient_sdp(True)
@@ -53,6 +51,7 @@ def process_directory(input_dir):
         transformer=transformer,
     )
     pipe.enable_model_cpu_offload()
+    pipe.set_progress_bar_config(disable=True)
     # pipe.scheduler = EulerDiscreteScheduler.from_config(pipe.scheduler.config)
 
     adapter_id = "alimama-creative/FLUX.1-Turbo-Alpha"
@@ -82,7 +81,6 @@ def process_directory(input_dir):
             def callback(pipe, step, timestep, callback_kwargs):
                 latents = callback_kwargs.get("latents", None)
                 callback.step_pbar.update(1)
-                print(f"Step {step} / {num_inference_steps} | Timestep: {timestep}")  # Debugging output
                 return {"latents": latents} if latents is not None else {}  # Ensure a valid return type
 
             # Set the timesteps and strength for the inference
@@ -97,7 +95,7 @@ def process_directory(input_dir):
                 result = pipe(
                     prompt="Very detailed, masterpiece quality",
                     image=init_image,
-                    num_inference_steps=num_inference_steps,
+                    num_inference_steps=int(num_inference_steps),
                     strength=strength,
                     guidance_scale=3.5,
                     height=height,
