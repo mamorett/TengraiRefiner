@@ -39,6 +39,7 @@ print(datetime.datetime.now(), "Quantizing text encoder 2")
 quantize(text_encoder_2, weights=qfloat8)
 freeze(text_encoder_2)
 
+
 def process_directory(input_dir):
     output_dir = os.path.join(input_dir, "FluxSchnell")
     os.makedirs(output_dir, exist_ok=True)
@@ -85,17 +86,20 @@ def process_directory(input_dir):
                 print(f"Step {step} / {num_inference_steps} | Timestep: {timestep}")  # Debugging output
                 return {"latents": latents} if latents is not None else {}  # Ensure a valid return type
 
-            # Set the timesteps and sigmas
-            num_inference_steps = 50
+            # Set the timesteps and strength for the inference
+            strength = 0.20
+            desired_num_steps = 10
+            # see https://huggingface.co/docs/diffusers/api/pipelines/flux#diffusers.FluxImg2ImgPipeline for more details
+            num_inference_steps = desired_num_steps / strength
 
-            with tqdm(total=num_inference_steps, desc=f"Steps for {filename}", leave=True) as step_pbar:
+            with tqdm(total=desired_num_steps, desc=f"Steps for {filename}", leave=True) as step_pbar:
                 callback.step_pbar = step_pbar
 
                 result = pipe(
                     prompt="Very detailed, masterpiece quality",
                     image=init_image,
                     num_inference_steps=num_inference_steps,
-                    strength=0.20,
+                    strength=strength,
                     guidance_scale=3.5,
                     height=height,
                     width=width,
@@ -108,6 +112,6 @@ def process_directory(input_dir):
 if __name__ == "__main__":
     import sys
     if len(sys.argv) != 2:
-        print("Usage: python script.py <directory_path>")
+        print("Usage: python refiner.py <directory_path>")
     else:
         process_directory(sys.argv[1])
