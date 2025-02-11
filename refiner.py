@@ -39,7 +39,6 @@ print(datetime.datetime.now(), "Quantizing text encoder 2")
 quantize(text_encoder_2, weights=qfloat8)
 freeze(text_encoder_2)
 
-
 def process_directory(input_dir):
     output_dir = os.path.join(input_dir, "FluxSchnell")
     os.makedirs(output_dir, exist_ok=True)
