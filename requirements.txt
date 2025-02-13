@@ -1,7 +1,7 @@
-torch>=2.2.0
-diffusers == 0.31.0
+torch>=2.6.0
+diffusers==0.32.2
 transformers>=4.35.0
-# accelerate>=0.27.0
+# accelerate>=0.27.0  # Uncomment if needed
 safetensors>=0.4.0
 python-dotenv>=1.0.0
 Pillow>=10.0.0
@@ -9,3 +9,4 @@ tqdm>=4.66.0
 huggingface-hub>=0.19.0
 optimum-quanto
 multiformats
+xformers>=0.0.25  # Ensures compatibility with PyTorch 2.6.0+cu124
