@@ -1,8 +1,10 @@
+import torchvision
+torchvision.disable_beta_transforms_warning()
 from dotenv import load_dotenv
 import os
 import torch
 from PIL import Image
-from diffusers import FluxImg2ImgPipeline, FluxPriorReduxPipeline
+from diffusers import FluxImg2ImgPipeline, FluxPriorReduxPipeline, FluxPipeline
 from tqdm import tqdm
 import datetime
 from transformers import CLIPTextModel, CLIPTokenizer, T5EncoderModel, T5TokenizerFast
@@ -33,26 +35,26 @@ tokenizer_2 = T5TokenizerFast.from_pretrained(bfl_repo, subfolder="tokenizer_2",
 vae = AutoencoderKL.from_pretrained(bfl_repo, subfolder="vae", torch_dtype=dtype, revision=revision)
 transformer = FluxTransformer2DModel.from_pretrained(bfl_repo, subfolder="transformer", torch_dtype=dtype, revision=revision)
 
-print(datetime.datetime.now(), "Quantizing transformer")
-quantize(transformer, weights=qfloat8)
-freeze(transformer)
 
-print(datetime.datetime.now(), "Quantizing text encoder 2")
-quantize(text_encoder_2, weights=qfloat8)
-freeze(text_encoder_2)
-
-def process_directory(input_dir, output_dir, acceleration, redux):
+def process_directory(input_dir, output_dir, acceleration, redux, prompt):
     os.makedirs(output_dir, exist_ok=True)
     if redux:
-        pipe = FluxPriorReduxPipeline(
-            scheduler=scheduler,
-            text_encoder=text_encoder,
-            tokenizer=tokenizer,
-            text_encoder_2=text_encoder_2,
-            tokenizer_2=tokenizer_2,
-            vae=vae,
-            transformer=transformer,
-        )
+        pipe_prior_redux = FluxPriorReduxPipeline.from_pretrained(repo_redux, torch_dtype=dtype)
+        pipe = FluxPipeline.from_pretrained(
+            bfl_repo, 
+            text_encoder=None,
+            text_encoder_2=None,
+            torch_dtype=dtype
+        )      
+        # pipe = FluxPriorReduxPipeline(
+        #     scheduler=scheduler,
+        #     text_encoder=text_encoder,
+        #     tokenizer=tokenizer,
+        #     text_encoder_2=text_encoder_2,
+        #     tokenizer_2=tokenizer_2,
+        #     vae=vae,
+        #     transformer=transformer,
+        # )
     else:
         pipe = FluxImg2ImgPipeline(
             scheduler=scheduler,
@@ -77,10 +79,19 @@ def process_directory(input_dir, output_dir, acceleration, redux):
         pipe.load_lora_weights(adapter_id)
         pipe.fuse_lora(lora_scale=1)
 
+    print(datetime.datetime.now(), "Quantizing transformer")
+    quantize(transformer, weights=qfloat8)
+    freeze(transformer)
+
+    print(datetime.datetime.now(), "Quantizing text encoder 2")
+    quantize(text_encoder_2, weights=qfloat8)
+    freeze(text_encoder_2)
+
     # Check if input_dir is a file or directory
     if os.path.isfile(input_dir):
-        # If input_dir is a file then add it to files_to_process.
-        png_files = [input_dir]
+        # If input_dir is a file, extract its directory and filename separately
+        input_dir, filename = os.path.split(input_dir)
+        png_files = [filename]  # Store only the filename
     elif os.path.isdir(input_dir):
         # If input_dir is a directory, leave the code as it was originally.
         png_files = sorted([f for f in os.listdir(input_dir) if f.lower().endswith('.png')])
@@ -89,8 +100,11 @@ def process_directory(input_dir, output_dir, acceleration, redux):
 
     # Create a list of files that need processing, excluding already processed files
     files_to_process = []
+    print (f"output_dir directory: {output_dir}")
+    
     for f in png_files:
-        output_path = os.path.join(output_dir, f)  # Output path is based on the filename
+        filename = os.path.basename(f)  # Extract only the filename
+        output_path = os.path.join(output_dir, filename)  # Output path is based on the filename
         print (f"Output path: {output_path}")
         if not os.path.exists(output_path):
             files_to_process.append(f)  # Only add files that don't exist in the output directory
@@ -124,29 +138,55 @@ def process_directory(input_dir, output_dir, acceleration, redux):
                     return {"latents": latents} if latents is not None else {}  # Ensure a valid return type
 
                 # Set the timesteps and strength for the inference
-                strength = 0.20
-                if acceleration == "fluxfull":
-                    desired_num_steps = 25
+                if redux:
+                    strength = 1.0
                 else:
+                    strength = 0.20
+                if acceleration in ["alimama", "hyper"]:
                     desired_num_steps = 10
+                else:
+                    desired_num_steps = 25
                 # see https://huggingface.co/docs/diffusers/api/pipelines/flux#diffusers.FluxImg2ImgPipeline for more details
                 num_inference_steps = desired_num_steps / strength
 
+                if redux:
+                    num_images = 1
+                    pipe_prior_output = pipe_prior_redux(init_image)
+                else:
+                    num_images = 1
+
                 with tqdm(total=desired_num_steps, desc=f"Steps for {fname}", leave=True) as step_pbar:
                     callback.step_pbar = step_pbar
+                    if redux:
+                        result = pipe(
+                            guidance_scale=2.5,
+                            num_inference_steps=int(num_inference_steps),
+                            generator=torch.Generator("cpu").manual_seed(0),
+                            **pipe_prior_output,
+                        ).images
+                    else:
+                        result = pipe(
+                            prompt=prompt,
+                            image=init_image,
+                            num_inference_steps=int(num_inference_steps),
+                            strength=strength,
+                            guidance_scale=3.0,
+                            height=height,
+                            width=width,
+                            num_images_per_prompt=num_images,
+                            callback_on_step_end=callback
+                        ).images
 
-                    result = pipe(
-                        prompt="Very detailed, masterpiece quality",
-                        image=init_image,
-                        num_inference_steps=int(num_inference_steps),
-                        strength=strength,
-                        guidance_scale=3.5,
-                        height=height,
-                        width=width,
-                        callback_on_step_end=callback
-                    ).images[0]
+                    # Saving images with appropriate filenames
+                    if len(result) > 1:
+                        # If multiple images, add suffixes
+                        for idx, img in enumerate(result):
+                            output_image_path = f"{output_path.rstrip('.png')}_{str(idx + 1).zfill(4)}.png"  # For example: image_0001.png
+                            img.save(output_image_path)
+                    else:
+                        # If only one image, save normally
+                        result[0].save(output_path)
 
-                result.save(output_path)
                 main_pbar.update(1)                
 
             except Exception as e:
@@ -162,6 +202,10 @@ def main():
                         choices=['alimama', 'hyper'],
                         default='alimama',
                         help='Acceleration LORA. Available options are Alimama Turbo or ByteDance Hyper (alimama|hyper) with 10 steps. If not provided, flux with 25 steps will be used.')
+    
+    parser.add_argument('--prompt', '-p', type=str,
+                    default='Very detailed, masterpiece quality',
+                    help='Set a custom prompts, if not defined defaults to Very detailed, masterpiece quality')
     
     parser.add_argument('--redux', '-r', action='store_true',
                         help="Use redux instead of img2img")            
@@ -181,15 +225,20 @@ def main():
         print(f"Error: {args.path} does not exist.")
         exit(1)
 
+    if not args.prompt:
+        args.prompt = 'Very detailed, masterpiece quality'
+
     # Determine output directory
     if args.subdir:
         out_dir = os.path.join(args.path, args.subdir)
     elif args.output_dir:
         out_dir = args.output_dir
     else:
-        out_dir = '.'  # Default to current directory
+        out_dir = os.getcwd() # Default to current directory
 
-    process_directory(args.path, out_dir, args.acceleration, args.redux)
+    print (f"Output directory: {out_dir}")
+
+    process_directory(args.path, out_dir, args.acceleration, args.redux, args.prompt)
 
 if __name__ == "__main__":
     main()
