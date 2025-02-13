@@ -2,7 +2,7 @@ from dotenv import load_dotenv
 import os
 import torch
 from PIL import Image
-from diffusers import FluxImg2ImgPipeline
+from diffusers import FluxImg2ImgPipeline, FluxPriorReduxPipeline
 from tqdm import tqdm
 import datetime
 from transformers import CLIPTextModel, CLIPTokenizer, T5EncoderModel, T5TokenizerFast
@@ -14,13 +14,16 @@ from huggingface_hub import hf_hub_download
 warnings.filterwarnings('ignore')
 import argparse
 
+load_dotenv()
 
 # Enable memory-efficient attention for SD-based models
 torch.backends.cuda.enable_mem_efficient_sdp(True)
 dtype = torch.bfloat16
 
 bfl_repo = "black-forest-labs/FLUX.1-dev"
-revision = "refs/pr/3"
+# revision = "refs/pr/3"
+revision = "main"
+repo_redux = "black-forest-labs/FLUX.1-Redux-dev"
 
 scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(bfl_repo, subfolder="scheduler", revision=revision)
 text_encoder = CLIPTextModel.from_pretrained("openai/clip-vit-large-patch14", torch_dtype=dtype)
@@ -38,18 +41,29 @@ print(datetime.datetime.now(), "Quantizing text encoder 2")
 quantize(text_encoder_2, weights=qfloat8)
 freeze(text_encoder_2)
 
-def process_directory(input_dir, output_dir, acceleration):
+def process_directory(input_dir, output_dir, acceleration, redux):
     os.makedirs(output_dir, exist_ok=True)
+    if redux:
+        pipe = FluxPriorReduxPipeline(
+            scheduler=scheduler,
+            text_encoder=text_encoder,
+            tokenizer=tokenizer,
+            text_encoder_2=text_encoder_2,
+            tokenizer_2=tokenizer_2,
+            vae=vae,
+            transformer=transformer,
+        )
+    else:
+        pipe = FluxImg2ImgPipeline(
+            scheduler=scheduler,
+            text_encoder=text_encoder,
+            tokenizer=tokenizer,
+            text_encoder_2=text_encoder_2,
+            tokenizer_2=tokenizer_2,
+            vae=vae,
+            transformer=transformer,
+        )
 
-    pipe = FluxImg2ImgPipeline(
-        scheduler=scheduler,
-        text_encoder=text_encoder,
-        tokenizer=tokenizer,
-        text_encoder_2=text_encoder_2,
-        tokenizer_2=tokenizer_2,
-        vae=vae,
-        transformer=transformer,
-    )
     pipe.enable_model_cpu_offload()
     pipe.set_progress_bar_config(disable=True)
 
@@ -63,8 +77,15 @@ def process_directory(input_dir, output_dir, acceleration):
         pipe.load_lora_weights(adapter_id)
         pipe.fuse_lora(lora_scale=1)
 
-    # Get the list of PNG files in the input directory
-    png_files = sorted([f for f in os.listdir(input_dir) if f.lower().endswith('.png')])
+    # Check if input_dir is a file or directory
+    if os.path.isfile(input_dir):
+        # If input_dir is a file then add it to files_to_process.
+        png_files = [input_dir]
+    elif os.path.isdir(input_dir):
+        # If input_dir is a directory, leave the code as it was originally.
+        png_files = sorted([f for f in os.listdir(input_dir) if f.lower().endswith('.png')])
+    else:
+        raise ValueError("Input must be either a file or a directory.")
 
     # Create a list of files that need processing, excluding already processed files
     files_to_process = []
@@ -133,39 +154,42 @@ def process_directory(input_dir, output_dir, acceleration):
 
 
 def main():
-    # Custom usage string for better clarity and control over help messages.
     parser = argparse.ArgumentParser(description="Process PNG files.")
-    parser.add_argument('directory_path', type=str, 
+    parser.add_argument('path', type=str, 
                         help='The path of the directory to process')
-
-    parser.add_argument('--output_dir', '-o', type=str,
-                        help='Optional output directory. If not provided, outputs will be placed in {directory_path}/FluxSchnell.')
 
     parser.add_argument('--acceleration', '-a', type=str,
                         choices=['alimama', 'hyper'],
                         default='alimama',
                         help='Acceleration LORA. Available options are Alimama Turbo or ByteDance Hyper (alimama|hyper) with 10 steps. If not provided, flux with 25 steps will be used.')
-                  
+    
+    parser.add_argument('--redux', '-r', action='store_true',
+                        help="Use redux instead of img2img")            
 
-    # Parse arguments
+    # Create mutually exclusive group
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument('--output_dir', '-o', type=str,
+                       help='Optional output directory. If not provided, outputs will be placed in current directory.')
+
+    group.add_argument('--subdir', '-s', type=str,
+                       help='Use subdir output directory. It will save all files in the specified subdirectory of the given path.')
+
     args = parser.parse_args()
 
-    # If output_dir is not provided, set it based on directory_path
-    if not args.output_dir:
-        args.output_dir = os.path.join(args.directory_path, "FluxSchnell")
+    # Ensure `path` is either a file or directory
+    if not os.path.exists(args.path):
+        print(f"Error: {args.path} does not exist.")
+        exit(1)
 
-    # If output_dir is not provided, set it based on directory_path
-    if not args.acceleration:
-        args.acceleration = "fluxfull"          
-    
-    # Check if the mandatory argument is missing
-    if not args.directory_path:
-        print("Error: Missing required argument 'directory_path'.")
-        parser.print_help()  # Print help message with custom usage string.
-        return
+    # Determine output directory
+    if args.subdir:
+        out_dir = os.path.join(args.path, args.subdir)
+    elif args.output_dir:
+        out_dir = args.output_dir
+    else:
+        out_dir = '.'  # Default to current directory
 
-    # Call your function with arguments
-    process_directory(str(args.directory_path), str(args.output_dir), str(args.acceleration))
+    process_directory(args.path, out_dir, args.acceleration, args.redux)
 
 if __name__ == "__main__":
     main()
