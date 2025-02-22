@@ -143,6 +143,12 @@ def process_directory(input_dir, output_dir, acceleration, redux, prompt, fp8):
                 init_image = load_image(input_path)
                 width, height = init_image.size
                 # Add your image processing logic here
+                current_pixels = width * height
+                
+                # If image is already 1MP or larger, return original
+                if current_pixels <= 1_000_000:
+                    init_image=upscale_to_sdxl(input_path)
+                    width, height = init_image.size       
 
                 def callback(pipe, step, timestep, callback_kwargs):
                     latents = callback_kwargs.get("latents", None)
@@ -206,6 +212,64 @@ def process_directory(input_dir, output_dir, acceleration, redux, prompt, fp8):
 
             except Exception as e:
                 print(f"Skipping {fname}: {e}")
+
+
+def upscale_to_sdxl(image_path):
+    """
+    Upscale image to nearest SDXL resolution (maintaining aspect ratio) if below 1 megapixel.
+    Common SDXL resolutions: 1024x1024, 1024x576, 576x1024, 1152x896, 896x1152, etc.
+    
+    Args:
+        image_path (str): Path to input image
+    
+    Returns:
+        PIL.Image: Resized image object
+    """
+    # Open the image
+    img = Image.open(image_path)
+    
+    # Get current dimensions
+    width, height = img.size
+    
+    # Calculate aspect ratio
+    aspect_ratio = width / height
+    
+    # SDXL base sizes to consider
+    sdxl_sizes = [
+        (1024, 1024),  # 1:1
+        (1024, 576),   # 16:9
+        (576, 1024),   # 9:16
+        (1152, 896),   # 9:7
+        (896, 1152),   # 7:9
+        (1024, 768),   # 4:3
+        (768, 1024),   # 3:4
+        (1216, 832),   # Additional sizes
+        (832, 1216),
+        (1344, 768),
+        (768, 1344),
+        (1536, 640),
+        (866, 1155),        
+        (640, 1536)
+    ]
+    
+    # Filter out sizes that are smaller than 1 megapixel
+    sdxl_sizes = [(w, h) for w, h in sdxl_sizes if w * h >= 1000000]
+    
+    # Find the best matching SDXL resolution
+    best_size = None
+    min_ratio_diff = float('inf')
+    
+    for w, h in sdxl_sizes:
+        current_ratio = w / h
+        ratio_diff = abs(current_ratio - aspect_ratio)
+        
+        if ratio_diff < min_ratio_diff:
+            min_ratio_diff = ratio_diff
+            best_size = (w, h)
+    
+    # Resize image using LANCZOS resampling (high quality)
+    resized_img = img.resize(best_size, Image.LANCZOS)   
+    return resized_img
 
 
 def main():
