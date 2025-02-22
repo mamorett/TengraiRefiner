@@ -1,4 +1,5 @@
 import torchvision
+from torchvision import transforms
 torchvision.disable_beta_transforms_warning()
 from dotenv import load_dotenv
 import os
@@ -15,6 +16,8 @@ import warnings
 from huggingface_hub import hf_hub_download
 warnings.filterwarnings('ignore')
 import argparse
+import numpy as np
+from diffusers.utils import load_image
 
 load_dotenv()
 
@@ -36,25 +39,25 @@ vae = AutoencoderKL.from_pretrained(bfl_repo, subfolder="vae", torch_dtype=dtype
 transformer = FluxTransformer2DModel.from_pretrained(bfl_repo, subfolder="transformer", torch_dtype=dtype, revision=revision)
 
 
-def process_directory(input_dir, output_dir, acceleration, redux, prompt):
+def process_directory(input_dir, output_dir, acceleration, redux, prompt, fp8):
     os.makedirs(output_dir, exist_ok=True)
     if redux:
         pipe_prior_redux = FluxPriorReduxPipeline.from_pretrained(repo_redux, torch_dtype=dtype)
-        pipe = FluxPipeline.from_pretrained(
-            bfl_repo, 
-            text_encoder=None,
-            text_encoder_2=None,
-            torch_dtype=dtype
-        )      
-        # pipe = FluxPriorReduxPipeline(
-        #     scheduler=scheduler,
-        #     text_encoder=text_encoder,
-        #     tokenizer=tokenizer,
-        #     text_encoder_2=text_encoder_2,
-        #     tokenizer_2=tokenizer_2,
-        #     vae=vae,
-        #     transformer=transformer,
+        # pipe = FluxPipeline.from_pretrained(
+        #     bfl_repo,
+        #     text_encoder=None,
+        #     text_encoder_2=None,
+        #     torch_dtype=dtype
         # )
+        pipe = FluxImg2ImgPipeline(
+            scheduler=scheduler,
+            text_encoder=None,
+            tokenizer=tokenizer,
+            text_encoder_2=None,
+            tokenizer_2=tokenizer_2,
+            vae=vae,
+            transformer=transformer,
+        )
     else:
         pipe = FluxImg2ImgPipeline(
             scheduler=scheduler,
@@ -79,13 +82,23 @@ def process_directory(input_dir, output_dir, acceleration, redux, prompt):
         pipe.load_lora_weights(adapter_id)
         pipe.fuse_lora(lora_scale=1)
 
-    print(datetime.datetime.now(), "Quantizing transformer")
-    quantize(transformer, weights=qfloat8)
-    freeze(transformer)
+    if fp8=="":
+        print(datetime.datetime.now(), "Quantizing transformer")
+        quantize(transformer, weights=qfloat8)
+        freeze(transformer)
+    else:
+        try:
+            print(f"Loading FP8 transformer: {fp8}")
+            fp8_transformer = torch.load(fp8, weights_only=False)
+            fp8_transformer.eval()
+            pipe.transformer = fp8_transformer
+        except Exception as e:
+            print(f"Error loading FP8 transformer: {e}")
+            print("Falling back to default transformer")
 
-    print(datetime.datetime.now(), "Quantizing text encoder 2")
-    quantize(text_encoder_2, weights=qfloat8)
-    freeze(text_encoder_2)
+    # print(datetime.datetime.now(), "Quantizing text encoder 2")
+    # quantize(text_encoder_2, weights=qfloat8)
+    # freeze(text_encoder_2)
 
     # Check if input_dir is a file or directory
     if os.path.isfile(input_dir):
@@ -128,7 +141,8 @@ def process_directory(input_dir, output_dir, acceleration, redux, prompt):
 
             try:
                 # Process the image file
-                init_image = Image.open(input_path).convert("RGB")
+                # init_image = Image.open(input_path).convert("RGB")
+                init_image = load_image(input_path)
                 width, height = init_image.size
                 # Add your image processing logic here
 
@@ -150,8 +164,9 @@ def process_directory(input_dir, output_dir, acceleration, redux, prompt):
                 num_inference_steps = desired_num_steps / strength
 
                 if redux:
+                    init_image = load_image("https://huggingface.co/datasets/YiYiXu/testing-images/resolve/main/style_ziggy/img5.png")
+                    pipe_prior_output = pipe_prior_redux(image=init_image)
                     num_images = 1
-                    pipe_prior_output = pipe_prior_redux(init_image)
                 else:
                     num_images = 1
 
@@ -208,7 +223,10 @@ def main():
                     help='Set a custom prompts, if not defined defaults to Very detailed, masterpiece quality')
     
     parser.add_argument('--redux', '-r', action='store_true',
-                        help="Use redux instead of img2img")            
+                        help="Use redux instead of img2img")           
+
+    parser.add_argument('--load-fp8', '-q', type=str,
+                        help="Use a local FP8 quantized transformer model")  
 
     # Create mutually exclusive group
     group = parser.add_mutually_exclusive_group()
@@ -238,7 +256,7 @@ def main():
 
     print (f"Output directory: {out_dir}")
 
-    process_directory(args.path, out_dir, args.acceleration, args.redux, args.prompt)
+    process_directory(args.path, out_dir, args.acceleration, args.redux, args.prompt, args.load_fp8)
 
 if __name__ == "__main__":
     main()
