@@ -16,7 +16,6 @@ import warnings
 from huggingface_hub import hf_hub_download
 warnings.filterwarnings('ignore')
 import argparse
-import numpy as np
 from diffusers.utils import load_image
 
 load_dotenv()
@@ -24,7 +23,6 @@ load_dotenv()
 # Enable memory-efficient attention for SD-based models
 torch.backends.cuda.enable_mem_efficient_sdp(True)
 dtype = torch.bfloat16
-
 bfl_repo = "black-forest-labs/FLUX.1-dev"
 # revision = "refs/pr/3"
 revision = "main"
@@ -40,16 +38,16 @@ transformer = FluxTransformer2DModel.from_pretrained(bfl_repo, subfolder="transf
 
 
 def process_directory(input_dir, output_dir, acceleration, redux, prompt, fp8):
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     os.makedirs(output_dir, exist_ok=True)
     if redux:
-        pipe_prior_redux = FluxPriorReduxPipeline.from_pretrained(repo_redux, torch_dtype=dtype)
-        # pipe = FluxPipeline.from_pretrained(
-        #     bfl_repo,
-        #     text_encoder=None,
-        #     text_encoder_2=None,
-        #     torch_dtype=dtype
-        # )
-        pipe = FluxImg2ImgPipeline(
+        pipe_prior_redux = FluxPriorReduxPipeline.from_pretrained(
+            repo_redux, 
+            torch_dtype=dtype
+        )    
+        pipe_prior_redux.enable_model_cpu_offload()
+
+        pipe = FluxPipeline(
             scheduler=scheduler,
             text_encoder=None,
             tokenizer=tokenizer,
@@ -82,23 +80,23 @@ def process_directory(input_dir, output_dir, acceleration, redux, prompt, fp8):
         pipe.load_lora_weights(adapter_id)
         pipe.fuse_lora(lora_scale=1)
 
-    if fp8=="":
+    if not fp8:
         print(datetime.datetime.now(), "Quantizing transformer")
         quantize(transformer, weights=qfloat8)
         freeze(transformer)
     else:
         try:
             print(f"Loading FP8 transformer: {fp8}")
-            fp8_transformer = torch.load(fp8, weights_only=False)
+            fp8_transformer = torch.load(fp8, weights_only=False, map_location=device)
             fp8_transformer.eval()
             pipe.transformer = fp8_transformer
         except Exception as e:
             print(f"Error loading FP8 transformer: {e}")
             print("Falling back to default transformer")
-
-    # print(datetime.datetime.now(), "Quantizing text encoder 2")
-    # quantize(text_encoder_2, weights=qfloat8)
-    # freeze(text_encoder_2)
+    if not redux:
+        print(datetime.datetime.now(), "Quantizing text encoder")
+        quantize(text_encoder, weights=qfloat8)
+        freeze(text_encoder)
 
     # Check if input_dir is a file or directory
     if os.path.isfile(input_dir):
@@ -162,35 +160,37 @@ def process_directory(input_dir, output_dir, acceleration, redux, prompt, fp8):
                     desired_num_steps = 25
                 # see https://huggingface.co/docs/diffusers/api/pipelines/flux#diffusers.FluxImg2ImgPipeline for more details
                 num_inference_steps = desired_num_steps / strength
-
-                if redux:
-                    init_image = load_image("https://huggingface.co/datasets/YiYiXu/testing-images/resolve/main/style_ziggy/img5.png")
-                    pipe_prior_output = pipe_prior_redux(image=init_image)
-                    num_images = 1
-                else:
-                    num_images = 1
-
-                with tqdm(total=desired_num_steps, desc=f"Steps for {fname}", leave=True) as step_pbar:
-                    callback.step_pbar = step_pbar
+                with torch.no_grad():  # Add this context manager
                     if redux:
-                        result = pipe(
-                            guidance_scale=2.5,
-                            num_inference_steps=int(num_inference_steps),
-                            generator=torch.Generator("cpu").manual_seed(0),
-                            **pipe_prior_output,
-                        ).images
+                        pipe_prior_output = pipe_prior_redux(image=init_image)
+                        num_images = 1
                     else:
-                        result = pipe(
-                            prompt=prompt,
-                            image=init_image,
-                            num_inference_steps=int(num_inference_steps),
-                            strength=strength,
-                            guidance_scale=3.0,
-                            height=height,
-                            width=width,
-                            num_images_per_prompt=num_images,
-                            callback_on_step_end=callback
-                        ).images
+                        num_images = 1
+                    with tqdm(total=desired_num_steps, desc=f"Steps for {fname}", leave=True) as step_pbar:
+                        callback.step_pbar = step_pbar
+                        if redux:
+                            # print("Running redux")
+                            result = pipe(
+                                guidance_scale=2.5,
+                                num_inference_steps=int(num_inference_steps),
+                                height=height,
+                                width=width,                                
+                                # generator=torch.Generator("cpu").manual_seed(0),
+                                **pipe_prior_output,
+                                callback_on_step_end=callback
+                            ).images
+                        else:
+                            result = pipe(
+                                prompt=prompt,
+                                image=init_image,
+                                num_inference_steps=int(num_inference_steps),
+                                strength=strength,
+                                guidance_scale=3.0,
+                                height=height,
+                                width=width,
+                                num_images_per_prompt=num_images,
+                                callback_on_step_end=callback
+                            ).images
 
                     # Saving images with appropriate filenames
                     if len(result) > 1:
@@ -214,8 +214,8 @@ def main():
                         help='The path of the directory to process')
 
     parser.add_argument('--acceleration', '-a', type=str,
-                        choices=['alimama', 'hyper'],
-                        default='alimama',
+                        choices=['alimama', 'hyper', 'none'],
+                        default='none',
                         help='Acceleration LORA. Available options are Alimama Turbo or ByteDance Hyper (alimama|hyper) with 10 steps. If not provided, flux with 25 steps will be used.')
     
     parser.add_argument('--prompt', '-p', type=str,
