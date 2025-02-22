@@ -36,6 +36,35 @@ tokenizer_2 = T5TokenizerFast.from_pretrained(bfl_repo, subfolder="tokenizer_2",
 vae = AutoencoderKL.from_pretrained(bfl_repo, subfolder="vae", torch_dtype=dtype, revision=revision)
 transformer = FluxTransformer2DModel.from_pretrained(bfl_repo, subfolder="transformer", torch_dtype=dtype, revision=revision)
 
+class LyingSigmaSampler:
+    def __init__(self, 
+                 dishonesty_factor: float = -0.05, 
+                 start_percent: float = 0.1, 
+                 end_percent: float = 0.9):
+        self.dishonesty_factor = dishonesty_factor
+        self.start_percent = start_percent
+        self.end_percent = end_percent
+
+    def __call__(self, model, x, sigmas, **kwargs):
+        start_percent, end_percent = self.start_percent, self.end_percent
+        ms = model.inner_model.inner_model.model_sampling
+        start_sigma, end_sigma = (
+            round(ms.percent_to_sigma(start_percent), 4),
+            round(ms.percent_to_sigma(end_percent), 4),
+        )
+        del ms
+
+        def model_wrapper(x, sigma, **extra_args):
+            sigma_float = float(sigma.max().detach().cpu())
+            if end_sigma <= sigma_float <= start_sigma:
+                sigma = sigma * (1.0 + self.dishonesty_factor)
+            return model(x, sigma, **extra_args)
+
+        for k in ("inner_model", "sigmas"):
+            if hasattr(model, k):
+                setattr(model_wrapper, k, getattr(model, k))
+
+        return model_wrapper(x, sigmas, **kwargs)
 
 def process_directory(input_dir, output_dir, acceleration, redux, prompt, fp8):
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -166,6 +195,14 @@ def process_directory(input_dir, output_dir, acceleration, redux, prompt, fp8):
                     desired_num_steps = 25
                 # see https://huggingface.co/docs/diffusers/api/pipelines/flux#diffusers.FluxImg2ImgPipeline for more details
                 num_inference_steps = desired_num_steps / strength
+
+                # Detailer Daemon
+                pipe.scheduler.set_sigmas = LyingSigmaSampler(
+                    dishonesty_factor=-0.05,
+                    start_percent=0.1,
+                    end_percent=0.9
+                )
+
                 with torch.no_grad():  # Add this context manager
                     if redux:
                         pipe_prior_output = pipe_prior_redux(image=init_image)
