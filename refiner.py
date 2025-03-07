@@ -17,6 +17,7 @@ from huggingface_hub import hf_hub_download
 warnings.filterwarnings('ignore')
 import argparse
 from diffusers.utils import load_image
+from safetensors.torch import load_file  # Import safetensors loader
 
 load_dotenv()
 
@@ -27,13 +28,14 @@ bfl_repo = "black-forest-labs/FLUX.1-dev"
 # revision = "refs/pr/3"
 revision = "main"
 repo_redux = "black-forest-labs/FLUX.1-Redux-dev"
+device = "cuda" if torch.cuda.is_available() else "cpu"
 
 scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(bfl_repo, subfolder="scheduler", revision=revision)
 text_encoder = CLIPTextModel.from_pretrained("openai/clip-vit-large-patch14", torch_dtype=dtype)
 tokenizer = CLIPTokenizer.from_pretrained("openai/clip-vit-large-patch14", torch_dtype=dtype)
 text_encoder_2 = T5EncoderModel.from_pretrained(bfl_repo, subfolder="text_encoder_2", torch_dtype=dtype, revision=revision)
 tokenizer_2 = T5TokenizerFast.from_pretrained(bfl_repo, subfolder="tokenizer_2", torch_dtype=dtype, revision=revision)
-vae = AutoencoderKL.from_pretrained(bfl_repo, subfolder="vae", torch_dtype=dtype, revision=revision)
+vae = AutoencoderKL.from_pretrained(bfl_repo, subfolder="vae", torch_dtype=dtype, revision=revision).to(device)
 transformer = FluxTransformer2DModel.from_pretrained(bfl_repo, subfolder="transformer", torch_dtype=dtype, revision=revision)
 
 class LyingSigmaSampler:
@@ -69,6 +71,37 @@ class LyingSigmaSampler:
 def process_directory(input_dir, output_dir, acceleration, redux, prompt, fp8):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     os.makedirs(output_dir, exist_ok=True)
+    
+    # Handle transformer setup before creating the pipeline
+    # Make transformer a local variable instead of using the global one
+    local_transformer = FluxTransformer2DModel.from_pretrained(bfl_repo, subfolder="transformer", torch_dtype=dtype, revision=revision)
+    
+    if fp8:
+        try:
+            # Load transformer from custom FP8 model
+            state_dict = load_file(fp8, device=device)
+            local_transformer.load_state_dict(state_dict, strict=False)
+            local_transformer.eval()
+        except Exception as e:
+            print(f"Error loading transformer: {e}")
+            print("Falling back to default transformer from repository")
+            # Quantize the transformer
+            print(datetime.datetime.now(), "Quantizing transformer")
+            quantize(local_transformer, weights=qfloat8)
+            freeze(local_transformer)
+    else:
+        if acceleration == "hyper":
+            repo_name = "ByteDance/Hyper-SD"
+            ckpt_name = "Hyper-FLUX.1-dev-8steps-lora.safetensors"
+        elif acceleration == "alimama":
+            adapter_id = "alimama-creative/FLUX.1-Turbo-Alpha"
+        
+        # Apply quantization by default
+        print(datetime.datetime.now(), "Quantizing transformer")
+        quantize(local_transformer, weights=qfloat8)
+        freeze(local_transformer)
+
+    # Create appropriate pipeline based on redux flag
     if redux:
         pipe_prior_redux = FluxPriorReduxPipeline.from_pretrained(
             repo_redux, 
@@ -83,7 +116,7 @@ def process_directory(input_dir, output_dir, acceleration, redux, prompt, fp8):
             text_encoder_2=None,
             tokenizer_2=tokenizer_2,
             vae=vae,
-            transformer=transformer,
+            transformer=local_transformer,
         )
     else:
         pipe = FluxImg2ImgPipeline(
@@ -93,35 +126,27 @@ def process_directory(input_dir, output_dir, acceleration, redux, prompt, fp8):
             text_encoder_2=text_encoder_2,
             tokenizer_2=tokenizer_2,
             vae=vae,
-            transformer=transformer,
+            transformer=local_transformer,
         )
 
-    pipe.enable_model_cpu_offload()
+
+    # Enhanced offloading
+    pipe.enable_sequential_cpu_offload()
+    # pipe.enable_model_cpu_offload()
     pipe.set_progress_bar_config(disable=True)
 
-    if acceleration == "hyper":
-        repo_name = "ByteDance/Hyper-SD"
-        ckpt_name = "Hyper-FLUX.1-dev-8steps-lora.safetensors"
-        pipe.load_lora_weights(hf_hub_download(repo_name, ckpt_name))
-        pipe.fuse_lora(lora_scale=0.125)
-    elif acceleration == "alimama":
-        adapter_id = "alimama-creative/FLUX.1-Turbo-Alpha"
-        pipe.load_lora_weights(adapter_id)
-        pipe.fuse_lora(lora_scale=1)
+    # Apply LoRA weights if using acceleration
+    if not fp8 and acceleration:
+        if acceleration == "hyper":
+            repo_name = "ByteDance/Hyper-SD"
+            ckpt_name = "Hyper-FLUX.1-dev-8steps-lora.safetensors"
+            pipe.load_lora_weights(hf_hub_download(repo_name, ckpt_name))
+            pipe.fuse_lora(lora_scale=0.125)
+        elif acceleration == "alimama":
+            adapter_id = "alimama-creative/FLUX.1-Turbo-Alpha"
+            pipe.load_lora_weights(adapter_id)
+            pipe.fuse_lora(lora_scale=1)
 
-    if not fp8:
-        print(datetime.datetime.now(), "Quantizing transformer")
-        quantize(transformer, weights=qfloat8)
-        freeze(transformer)
-    else:
-        try:
-            print(f"Loading FP8 transformer: {fp8}")
-            fp8_transformer = torch.load(fp8, weights_only=False, map_location=device)
-            fp8_transformer.eval()
-            pipe.transformer = fp8_transformer
-        except Exception as e:
-            print(f"Error loading FP8 transformer: {e}")
-            print("Falling back to default transformer")
     if not redux:
         print(datetime.datetime.now(), "Quantizing text encoder")
         quantize(text_encoder, weights=qfloat8)
@@ -169,15 +194,17 @@ def process_directory(input_dir, output_dir, acceleration, redux, prompt, fp8):
             try:
                 # Process the image file
                 # init_image = Image.open(input_path).convert("RGB")
-                init_image = load_image(input_path)
-                width, height = init_image.size
+                init_image = load_image(input_path).convert("RGB")
+                init_image = transforms.ToTensor()(init_image).to(device, dtype=dtype)
+                width, height = init_image.shape[-1], init_image.shape[-2]  # Update to tensor dimensions
                 # Add your image processing logic here
                 current_pixels = width * height
                 
                 # If image is already 1MP or larger, return original
                 if current_pixels <= 1_000_000:
-                    init_image=upscale_to_sdxl(input_path)
-                    width, height = init_image.size       
+                    init_image = upscale_to_sdxl(input_path)  # This returns a PIL image
+                    init_image = transforms.ToTensor()(init_image).to(device, dtype=dtype)  # Convert back to tensor
+                    width, height = init_image.shape[-1], init_image.shape[-2]    
 
                 def callback(pipe, step, timestep, callback_kwargs):
                     latents = callback_kwargs.get("latents", None)
