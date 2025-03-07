@@ -122,10 +122,6 @@ def process_directory(input_dir, output_dir, acceleration, redux, prompt, fp8):
         except Exception as e:
             print(f"Error loading FP8 transformer: {e}")
             print("Falling back to default transformer")
-    if not redux:
-        print(datetime.datetime.now(), "Quantizing text encoder")
-        quantize(text_encoder, weights=qfloat8)
-        freeze(text_encoder)
 
     # Check if input_dir is a file or directory
     if os.path.isfile(input_dir):
