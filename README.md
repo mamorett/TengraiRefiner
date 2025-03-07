@@ -152,6 +152,7 @@ The script includes several optimizations:
 - Progress bars show both overall progress and per-image steps
 - Environment variables can be configured via .env file
 - Original file names are preserved in output
+- FP8 safetensor files must be compatible with FluxTransformer2DModel
 
 ---
 ##  Project Roadmap
