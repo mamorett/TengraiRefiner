@@ -17,6 +17,7 @@ from huggingface_hub import hf_hub_download
 warnings.filterwarnings('ignore')
 import argparse
 from diffusers.utils import load_image
+from safetensors.torch import load_file
 
 load_dotenv()
 
@@ -28,13 +29,6 @@ bfl_repo = "black-forest-labs/FLUX.1-dev"
 revision = "main"
 repo_redux = "black-forest-labs/FLUX.1-Redux-dev"
 
-scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(bfl_repo, subfolder="scheduler", revision=revision)
-text_encoder = CLIPTextModel.from_pretrained("openai/clip-vit-large-patch14", torch_dtype=dtype)
-tokenizer = CLIPTokenizer.from_pretrained("openai/clip-vit-large-patch14", torch_dtype=dtype)
-text_encoder_2 = T5EncoderModel.from_pretrained(bfl_repo, subfolder="text_encoder_2", torch_dtype=dtype, revision=revision)
-tokenizer_2 = T5TokenizerFast.from_pretrained(bfl_repo, subfolder="tokenizer_2", torch_dtype=dtype, revision=revision)
-vae = AutoencoderKL.from_pretrained(bfl_repo, subfolder="vae", torch_dtype=dtype, revision=revision)
-transformer = FluxTransformer2DModel.from_pretrained(bfl_repo, subfolder="transformer", torch_dtype=dtype, revision=revision)
 
 class LyingSigmaSampler:
     def __init__(self, 
@@ -68,19 +62,62 @@ class LyingSigmaSampler:
 
 def process_directory(input_dir, output_dir, acceleration, redux, prompt, fp8):
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    os.makedirs(output_dir, exist_ok=True)
+    dtype = torch.bfloat16  # Define dtype as an instance attribute
+    
+    # 1. Load base components first
+    scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(bfl_repo, subfolder="scheduler", revision=revision)
+    tokenizer = CLIPTokenizer.from_pretrained("openai/clip-vit-large-patch14", torch_dtype=dtype)
+    tokenizer_2 = T5TokenizerFast.from_pretrained(bfl_repo, subfolder="tokenizer_2", torch_dtype=dtype, revision=revision)
+    vae = AutoencoderKL.from_pretrained(bfl_repo, subfolder="vae", torch_dtype=dtype, revision=revision).to(device)
+
+    # 2. Handle transformer loading FIRST
+    transformer = FluxTransformer2DModel.from_pretrained(bfl_repo, subfolder="transformer", torch_dtype=dtype, revision=revision).to("cpu")
+    
+    if fp8:
+        try:
+            print(f"Loading FP8 transformer: {fp8}")
+            if not fp8.endswith('.safetensors'):
+                raise ValueError("FP8 model must be a .safetensors file")
+
+            # Clear memory before loading
+            torch.cuda.empty_cache()
+            
+            # Load to CPU first
+            state_dict = load_file(fp8, device=device)
+           
+            # Load with strict=False and report mismatches
+            missing, unexpected = transformer.load_state_dict(state_dict, strict=False)
+            if missing:
+                print(f"Missing keys ({len(missing)}): {', '.join(missing[:3])}...")
+            if unexpected:
+                print(f"Unexpected keys ({len(unexpected)}): {', '.join(unexpected[:3])}...")
+            
+            del state_dict
+            transformer.eval()
+            
+        except Exception as e:
+            print(f"FP8 load failed: {e}")
+            print("Reverting to standard transformer")
+            transformer = FluxTransformer2DModel.from_pretrained(bfl_repo, subfolder="transformer", torch_dtype=dtype, revision=revision)
+    else:
+        # Original quantization logic
+        quantize(transformer, weights=qfloat8)
+        freeze(transformer)
+    
+    # 3. Now load text encoders AFTER transformer
+    text_encoder = CLIPTextModel.from_pretrained("openai/clip-vit-large-patch14", torch_dtype=dtype)
+    text_encoder_2 = T5EncoderModel.from_pretrained(bfl_repo, subfolder="text_encoder_2", torch_dtype=dtype, revision=revision)
+
+    # 4. Create pipeline AFTER all components are loaded
     if redux:
         pipe_prior_redux = FluxPriorReduxPipeline.from_pretrained(
             repo_redux, 
             torch_dtype=dtype
-        )    
-        pipe_prior_redux.enable_model_cpu_offload()
-
+        )
+        
         pipe = FluxPipeline(
             scheduler=scheduler,
-            text_encoder=None,
             tokenizer=tokenizer,
-            text_encoder_2=None,
             tokenizer_2=tokenizer_2,
             vae=vae,
             transformer=transformer,
@@ -96,7 +133,17 @@ def process_directory(input_dir, output_dir, acceleration, redux, prompt, fp8):
             transformer=transformer,
         )
 
-    pipe.enable_model_cpu_offload()
+    # 5. Add memory optimization
+    pipe.enable_sequential_cpu_offload()
+    pipe.enable_attention_slicing()
+    if hasattr(pipe, "enable_vae_slicing"):
+        pipe.enable_vae_slicing()
+
+    # 6. Force clean initialization
+    torch.cuda.empty_cache()
+    with torch.no_grad():
+        pipe.text_encoder(torch.zeros((1, 77), dtype=torch.long).to(device))  # Warmup        
+
     pipe.set_progress_bar_config(disable=True)
 
     if acceleration == "hyper":
@@ -116,9 +163,34 @@ def process_directory(input_dir, output_dir, acceleration, redux, prompt, fp8):
     else:
         try:
             print(f"Loading FP8 transformer: {fp8}")
-            fp8_transformer = torch.load(fp8, weights_only=False, map_location=device)
-            fp8_transformer.eval()
-            pipe.transformer = fp8_transformer
+            if not fp8.endswith('.safetensors'):
+                raise ValueError("FP8 model must be a .safetensors file")
+
+            # 1. Clear GPU cache before loading
+            torch.cuda.empty_cache()
+            
+            # 2. Load to CPU first to avoid OOM
+            state_dict = load_file(fp8, device="cpu")
+            
+            # 3. Move original transformer to CPU for loading
+            transformer = transformer.to("cpu")
+            
+            # 4. Load with strict=False to ignore missing/unexpected keys
+            missing, unexpected = transformer.load_state_dict(state_dict, strict=False)
+            
+            if missing:
+                print(f"Missing keys (may affect performance): {missing[:5]}... ({len(missing)} total)")
+            if unexpected:
+                print(f"Unexpected keys (probably safe to ignore): {unexpected[:5]}... ({len(unexpected)} total)")
+            
+            # 5. Move back to target device
+            transformer = transformer.to(device)
+            transformer.eval()
+
+            # 6. Force clean memory
+            del state_dict
+            torch.cuda.empty_cache()
+
         except Exception as e:
             print(f"Error loading FP8 transformer: {e}")
             print("Falling back to default transformer")
@@ -185,11 +257,11 @@ def process_directory(input_dir, output_dir, acceleration, redux, prompt, fp8):
                     return {"latents": latents} if latents is not None else {}  # Ensure a valid return type
 
                 # Set the timesteps and strength for the inference
-                if redux:
+                if redux or fp8:
                     strength = 1.0
                 else:
                     strength = 0.20
-                if acceleration in ["alimama", "hyper"]:
+                if acceleration in ["alimama", "hyper"] or fp8:
                     desired_num_steps = 10
                 else:
                     desired_num_steps = 25
