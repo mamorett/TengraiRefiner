@@ -5,10 +5,10 @@ from dotenv import load_dotenv
 import os
 import torch
 from PIL import Image
-from diffusers import FluxImg2ImgPipeline, FluxPriorReduxPipeline, FluxPipeline
+from diffusers import FluxImg2ImgPipeline, FluxPriorReduxPipeline, FluxPipeline, FluxControlPipeline
 from tqdm import tqdm
 import datetime
-from transformers import CLIPTextModel, CLIPTokenizer, T5EncoderModel, T5TokenizerFast
+from transformers import CLIPTextModel, CLIPTokenizer, T5EncoderModel, T5TokenizerFast, AutoModelForCausalLM, AutoProcessor
 from diffusers import FlowMatchEulerDiscreteScheduler, AutoencoderKL
 from diffusers.models.transformers.transformer_flux import FluxTransformer2DModel
 from optimum.quanto import freeze, qfloat8, quantize
@@ -17,6 +17,7 @@ from huggingface_hub import hf_hub_download
 warnings.filterwarnings('ignore')
 import argparse
 from diffusers.utils import load_image
+from image_gen_aux import DepthPreprocessor
 
 load_dotenv()
 
@@ -25,16 +26,12 @@ torch.backends.cuda.enable_mem_efficient_sdp(True)
 dtype = torch.bfloat16
 bfl_repo = "black-forest-labs/FLUX.1-dev"
 # revision = "refs/pr/3"
-revision = "main"
+# revision = "main"
 repo_redux = "black-forest-labs/FLUX.1-Redux-dev"
+repo_depth = "black-forest-labs/FLUX.1-Depth-dev"
 
-scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(bfl_repo, subfolder="scheduler", revision=revision)
-text_encoder = CLIPTextModel.from_pretrained("openai/clip-vit-large-patch14", torch_dtype=dtype)
-tokenizer = CLIPTokenizer.from_pretrained("openai/clip-vit-large-patch14", torch_dtype=dtype)
-text_encoder_2 = T5EncoderModel.from_pretrained(bfl_repo, subfolder="text_encoder_2", torch_dtype=dtype, revision=revision)
-tokenizer_2 = T5TokenizerFast.from_pretrained(bfl_repo, subfolder="tokenizer_2", torch_dtype=dtype, revision=revision)
-vae = AutoencoderKL.from_pretrained(bfl_repo, subfolder="vae", torch_dtype=dtype, revision=revision)
-transformer = FluxTransformer2DModel.from_pretrained(bfl_repo, subfolder="transformer", torch_dtype=dtype, revision=revision)
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
 
 class LyingSigmaSampler:
     def __init__(self, 
@@ -66,8 +63,55 @@ class LyingSigmaSampler:
 
         return model_wrapper(x, sigmas, **kwargs)
 
+def prepare_repo(repo_name, revision="main"):
+    scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(bfl_repo, subfolder="scheduler", revision=revision)
+    text_encoder = CLIPTextModel.from_pretrained("openai/clip-vit-large-patch14", torch_dtype=dtype)
+    tokenizer = CLIPTokenizer.from_pretrained("openai/clip-vit-large-patch14", torch_dtype=dtype)
+    text_encoder_2 = T5EncoderModel.from_pretrained(bfl_repo, subfolder="text_encoder_2", torch_dtype=dtype, revision=revision)
+    tokenizer_2 = T5TokenizerFast.from_pretrained(bfl_repo, subfolder="tokenizer_2", torch_dtype=dtype, revision=revision)
+    vae = AutoencoderKL.from_pretrained(bfl_repo, subfolder="vae", torch_dtype=dtype, revision=revision)
+    transformer = FluxTransformer2DModel.from_pretrained(repo_name, subfolder="transformer", torch_dtype=dtype, revision=revision)
+    return scheduler, text_encoder, tokenizer, text_encoder_2, tokenizer_2, vae, transformer
+
+
+def miaoshuai_tagger(image):
+    # Use AutoModelForCausalLM instead of directly loading the model class
+    model = AutoModelForCausalLM.from_pretrained(
+        "MiaoshouAI/Florence-2-large-PromptGen-v2.0", 
+        trust_remote_code=True
+    ).to(device)
+    
+    processor = AutoProcessor.from_pretrained(
+        "MiaoshouAI/Florence-2-large-PromptGen-v2.0", 
+        trust_remote_code=True
+    )
+
+    prompt = "<MORE_DETAILED_CAPTION>"
+
+    inputs = processor(text=prompt, images=image, return_tensors="pt").to(device)
+
+    generated_ids = model.generate(
+        input_ids=inputs["input_ids"],
+        pixel_values=inputs["pixel_values"],
+        max_new_tokens=1024,
+        do_sample=False,
+        num_beams=3
+    )
+    generated_text = processor.batch_decode(generated_ids, skip_special_tokens=False)[0]
+
+    parsed_answer = processor.post_process_generation(generated_text, task=prompt, image_size=(image.width, image.height))
+
+    # Extract the string from the dictionary
+    if isinstance(parsed_answer, dict) and prompt in parsed_answer:
+        result = parsed_answer[prompt]
+    else:
+        result = str(parsed_answer)  # Fallback to string representation
+    
+    print(result)
+    return result  # Return the string instead of the dictionary
+
+
 def apply_loras(lorafile, pipe):
-    device = "cuda" if torch.cuda.is_available() else "cpu"
     if not lorafile:
         return pipe
 
@@ -85,11 +129,16 @@ def apply_loras(lorafile, pipe):
                 # Continue with next LoRA even if one fails
     return pipe
 
-def setup_pipeline(redux, acceleration, lora_file, fp8):
+def setup_pipeline(mode, acceleration, lora_file, fp8):
     """Set up and configure the appropriate pipeline based on parameters."""
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    pipe_prior_redux = None
+
+    if mode == "depth":
+        scheduler, text_encoder, tokenizer, text_encoder_2, tokenizer_2, vae, transformer = prepare_repo(repo_depth, revision="main")
+    else:
+        scheduler, text_encoder, tokenizer, text_encoder_2, tokenizer_2, vae, transformer = prepare_repo(bfl_repo, revision="main")
     
-    if redux:
+    if mode=="redux":
         pipe_prior_redux = FluxPriorReduxPipeline.from_pretrained(
             repo_redux, 
             torch_dtype=dtype
@@ -105,8 +154,7 @@ def setup_pipeline(redux, acceleration, lora_file, fp8):
             vae=vae,
             transformer=transformer,
         )
-        return pipe, pipe_prior_redux
-    else:
+    elif mode=="refiner":
         pipe = FluxImg2ImgPipeline(
             scheduler=scheduler,
             text_encoder=text_encoder,
@@ -116,40 +164,54 @@ def setup_pipeline(redux, acceleration, lora_file, fp8):
             vae=vae,
             transformer=transformer,
         )
-        pipe.enable_model_cpu_offload()
-        pipe.set_progress_bar_config(disable=True)
-        
-        # Apply LoRA before acceleration
-        if lora_file:
-            pipe = apply_loras(lora_file, pipe)
+    else:
+        pipe = FluxControlPipeline(
+            scheduler=scheduler,
+            text_encoder=text_encoder,
+            tokenizer=tokenizer,
+            text_encoder_2=text_encoder_2,
+            tokenizer_2=tokenizer_2,
+            vae=vae,
+            transformer=transformer,
+        )        
 
-        # Apply acceleration if specified
-        if acceleration == "hyper":
-            repo_name = "ByteDance/Hyper-SD"
-            ckpt_name = "Hyper-FLUX.1-dev-8steps-lora.safetensors"
-            pipe.load_lora_weights(hf_hub_download(repo_name, ckpt_name))
-            pipe.fuse_lora(lora_scale=0.125)
-        elif acceleration == "alimama":
-            adapter_id = "alimama-creative/FLUX.1-Turbo-Alpha"
-            pipe.load_lora_weights(adapter_id)
-            pipe.fuse_lora(lora_scale=1)
+    pipe.enable_model_cpu_offload()
+    pipe.enable_vae_slicing()
+    pipe.enable_attention_slicing(4)
 
-        # Handle transformer quantization or loading
-        if not fp8:
-            print(datetime.datetime.now(), "Quantizing transformer")
-            quantize(transformer, weights=qfloat8)
-            freeze(transformer)
-        else:
-            try:
-                print(f"Loading FP8 transformer: {fp8}")
-                fp8_transformer = torch.load(fp8, weights_only=False, map_location=device)
-                fp8_transformer.eval()
-                pipe.transformer = fp8_transformer
-            except Exception as e:
-                print(f"Error loading FP8 transformer: {e}")
-                print("Falling back to default transformer")
+    pipe.set_progress_bar_config(disable=True)
+    
+    # Apply LoRA before acceleration
+    if lora_file:
+        pipe = apply_loras(lora_file, pipe)
+
+    # Apply acceleration if specified
+    if acceleration == "hyper":
+        repo_name = "ByteDance/Hyper-SD"
+        ckpt_name = "Hyper-FLUX.1-dev-8steps-lora.safetensors"
+        pipe.load_lora_weights(hf_hub_download(repo_name, ckpt_name))
+        pipe.fuse_lora(lora_scale=0.125)
+    elif acceleration == "alimama":
+        adapter_id = "alimama-creative/FLUX.1-Turbo-Alpha"
+        pipe.load_lora_weights(adapter_id)
+        pipe.fuse_lora(lora_scale=1)
+
+    # Handle transformer quantization or loading
+    if not fp8:
+        print(datetime.datetime.now(), "Quantizing transformer")
+        quantize(transformer, weights=qfloat8)
+        freeze(transformer)
+    else:
+        try:
+            print(f"Loading FP8 transformer: {fp8}")
+            fp8_transformer = torch.load(fp8, weights_only=False, map_location=device)
+            fp8_transformer.eval()
+            pipe.transformer = fp8_transformer
+        except Exception as e:
+            print(f"Error loading FP8 transformer: {e}")
+            print("Falling back to default transformer")
                 
-        return pipe, None
+    return pipe, pipe_prior_redux
 
 def prepare_image(input_path, scale_down=False):
     """
@@ -195,7 +257,7 @@ def prepare_image(input_path, scale_down=False):
     
     return init_image, width, height
 
-def process_single_image(input_path, output_path, pipe, pipe_prior_redux, prompt, redux, acceleration, strength, scale_down):
+def process_single_image(input_path, output_path, pipe, pipe_prior_redux, prompt, mode, acceleration, strength, scale_down):
     """
     Process a single image with the configured pipeline.
     Args:
@@ -222,7 +284,7 @@ def process_single_image(input_path, output_path, pipe, pipe_prior_redux, prompt
             return {"latents": latents} if latents is not None else {}
         
         # Set the timesteps and strength for the inference
-        if redux:
+        if mode == "redux" or mode == "depth":
             # Redux always uses strength 1.0
             effective_strength = 1.0
         else:
@@ -233,9 +295,12 @@ def process_single_image(input_path, output_path, pipe, pipe_prior_redux, prompt
             desired_num_steps = 10
         else:
             desired_num_steps = 25
-            
+
         # Calculate inference steps based on strength
         num_inference_steps = desired_num_steps / effective_strength
+
+        if prompt == "auto":
+            prompt = miaoshuai_tagger(init_image)
 
         # Detailer Daemon
         pipe.scheduler.set_sigmas = LyingSigmaSampler(
@@ -245,15 +310,19 @@ def process_single_image(input_path, output_path, pipe, pipe_prior_redux, prompt
         )
 
         with torch.no_grad():
-            if redux:
+            if mode=="redux":
                 pipe_prior_output = pipe_prior_redux(image=init_image)
+                num_images = 1
+            elif mode=="refiner":
                 num_images = 1
             else:
                 num_images = 1
+                processor = DepthPreprocessor.from_pretrained("LiheYoung/depth-anything-large-hf").to(device)
+                control_image = processor(init_image)[0].convert("RGB")                
                 
             with tqdm(total=desired_num_steps, desc=f"Steps for {fname}", leave=True) as step_pbar:
                 callback.step_pbar = step_pbar
-                if redux:
+                if mode == "redux":
                     result = pipe(
                         guidance_scale=2.5,
                         num_inference_steps=int(num_inference_steps),
@@ -262,7 +331,7 @@ def process_single_image(input_path, output_path, pipe, pipe_prior_redux, prompt
                         **pipe_prior_output,
                         callback_on_step_end=callback
                     ).images
-                else:
+                elif mode == "refiner":
                     result = pipe(
                         prompt=prompt,
                         image=init_image,
@@ -274,6 +343,17 @@ def process_single_image(input_path, output_path, pipe, pipe_prior_redux, prompt
                         num_images_per_prompt=num_images,
                         callback_on_step_end=callback
                     ).images
+                else:
+                    result = pipe(
+                        prompt=prompt,
+                        control_image=control_image,
+                        num_inference_steps=int(num_inference_steps),
+                        guidance_scale=10.0,
+                        height=height,
+                        width=width,
+                        num_images_per_prompt=num_images,
+                        callback_on_step_end=callback
+                    ).images                 
 
             # Saving images with appropriate filenames
             if len(result) > 1:
@@ -336,7 +416,7 @@ def get_files_to_process(input_dir, output_dir):
     
     return input_dir, files_to_process
 
-def process_directory(input_dir, output_dir, acceleration, redux, prompt, fp8, lora_file, scale_down=False, strength=0.20):
+def process_directory(input_dir, output_dir, acceleration, prompt, fp8, lora_file, scale_down=False, strength=0.20,  mode="refiner"):
     """
     Process all images in a directory with the specified parameters.
     Args:
@@ -355,7 +435,7 @@ def process_directory(input_dir, output_dir, acceleration, redux, prompt, fp8, l
     os.makedirs(output_dir, exist_ok=True)
     
     # Setup the pipeline
-    pipe, pipe_prior_redux = setup_pipeline(redux, acceleration, lora_file, fp8)
+    pipe, pipe_prior_redux = setup_pipeline(mode, acceleration, lora_file, fp8)
     
     # Get files to process
     input_dir, files_to_process = get_files_to_process(input_dir, output_dir)
@@ -372,7 +452,7 @@ def process_directory(input_dir, output_dir, acceleration, redux, prompt, fp8, l
                 pipe, 
                 pipe_prior_redux, 
                 prompt, 
-                redux, 
+                mode, 
                 acceleration, 
                 strength,
                 scale_down
@@ -451,9 +531,11 @@ def main():
     parser.add_argument('--prompt', '-p', type=str,
                     default='Very detailed, masterpiece quality',
                     help='Set a custom prompts, if not defined defaults to Very detailed, masterpiece quality')
-    
-    parser.add_argument('--redux', '-r', action='store_true',
-                        help="Use redux instead of img2img")           
+
+    parser.add_argument('--mode', '-m', type=str,
+                    choices=['refiner', 'redux', 'depth'],
+                    default='refiner',
+                    help='Set mode of operation (refiner|redux|depth), if not defined defaults to refiner')     
 
     parser.add_argument('--load-fp8', '-q', type=str,
                         help="Use a local FP8 quantized transformer model")  
@@ -488,7 +570,7 @@ def main():
 
     print(f"Output directory: {out_dir}")
 
-    process_directory(args.path, out_dir, args.acceleration, args.redux, args.prompt, args.load_fp8, args.lora, args.scale_down, args.denoise)
+    process_directory(args.path, out_dir, args.acceleration, args.prompt, args.load_fp8, args.lora, args.scale_down, args.denoise, args.mode)
     
 if __name__ == "__main__":
     main()
