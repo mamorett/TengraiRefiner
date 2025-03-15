@@ -84,9 +84,11 @@ def apply_loras(lorafile, pipe):
                 print(f"Failed to apply LoRA {lora_name}: {str(e)}")
                 # Continue with next LoRA even if one fails
     return pipe
-def process_directory(input_dir, output_dir, acceleration, redux, prompt, fp8, lora_file, scale_down=False):
+
+def setup_pipeline(redux, acceleration, lora_file, fp8):
+    """Set up and configure the appropriate pipeline based on parameters."""
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    os.makedirs(output_dir, exist_ok=True)
+    
     if redux:
         pipe_prior_redux = FluxPriorReduxPipeline.from_pretrained(
             repo_redux, 
@@ -103,6 +105,7 @@ def process_directory(input_dir, output_dir, acceleration, redux, prompt, fp8, l
             vae=vae,
             transformer=transformer,
         )
+        return pipe, pipe_prior_redux
     else:
         pipe = FluxImg2ImgPipeline(
             scheduler=scheduler,
@@ -113,177 +116,215 @@ def process_directory(input_dir, output_dir, acceleration, redux, prompt, fp8, l
             vae=vae,
             transformer=transformer,
         )
+        pipe.enable_model_cpu_offload()
+        pipe.set_progress_bar_config(disable=True)
+        
+        # Apply LoRA before acceleration
+        if lora_file:
+            pipe = apply_loras(lora_file, pipe)
 
-    pipe.enable_model_cpu_offload()
-    pipe.set_progress_bar_config(disable=True)
+        # Apply acceleration if specified
+        if acceleration == "hyper":
+            repo_name = "ByteDance/Hyper-SD"
+            ckpt_name = "Hyper-FLUX.1-dev-8steps-lora.safetensors"
+            pipe.load_lora_weights(hf_hub_download(repo_name, ckpt_name))
+            pipe.fuse_lora(lora_scale=0.125)
+        elif acceleration == "alimama":
+            adapter_id = "alimama-creative/FLUX.1-Turbo-Alpha"
+            pipe.load_lora_weights(adapter_id)
+            pipe.fuse_lora(lora_scale=1)
 
-    # Apply LoRA before acceleration
-    if lora_file:
-        pipe = apply_loras(lora_file, pipe)
+        # Handle transformer quantization or loading
+        if not fp8:
+            print(datetime.datetime.now(), "Quantizing transformer")
+            quantize(transformer, weights=qfloat8)
+            freeze(transformer)
+        else:
+            try:
+                print(f"Loading FP8 transformer: {fp8}")
+                fp8_transformer = torch.load(fp8, weights_only=False, map_location=device)
+                fp8_transformer.eval()
+                pipe.transformer = fp8_transformer
+            except Exception as e:
+                print(f"Error loading FP8 transformer: {e}")
+                print("Falling back to default transformer")
+                
+        return pipe, None
 
-    if acceleration == "hyper":
-        repo_name = "ByteDance/Hyper-SD"
-        ckpt_name = "Hyper-FLUX.1-dev-8steps-lora.safetensors"
-        pipe.load_lora_weights(hf_hub_download(repo_name, ckpt_name))
-        pipe.fuse_lora(lora_scale=0.125)
-    elif acceleration == "alimama":
-        adapter_id = "alimama-creative/FLUX.1-Turbo-Alpha"
-        pipe.load_lora_weights(adapter_id)
-        pipe.fuse_lora(lora_scale=1)
+def prepare_image(input_path, scale_down=False):
+    """Prepare the input image with appropriate scaling."""
+    init_image = load_image(input_path)
+    fname = os.path.basename(input_path)
+    
+    # Debug scale-down process thoroughly
+    print(f"\nProcessing {fname}:")
+    # Apply scale down if requested
+    if scale_down:
+        width, height = init_image.size
+        pixel_count = width * height
+        print(f"  Original size: {width}x{height} ({pixel_count} pixels)")
+        if pixel_count > 1_500_000:  # Between 1.5MP and 2.2MP, scale down 2x
+            init_image = upscale_to_sdxl(input_path)
+        else:
+            print(f"  Image below 1.5MP, no scaling applied")
+        width, height = init_image.size  # Update dimensions after resize
+        print(f"  Size after resize: {width}x{height} ({width * height} pixels)")
+        
+    width, height = init_image.size  # Ensure we use the latest dimensions
+    current_pixels = width * height                    
+    # If image is already 1MP or larger, return original
+    if current_pixels <= 1_000_000:
+        print(f"  Image below 1Mpixel, scaling up to nearest SDXL resolution")
+        init_image = upscale_to_sdxl(input_path)
+        width, height = init_image.size       
 
-    if not fp8:
-        print(datetime.datetime.now(), "Quantizing transformer")
-        quantize(transformer, weights=qfloat8)
-        freeze(transformer)
-    else:
-        try:
-            print(f"Loading FP8 transformer: {fp8}")
-            fp8_transformer = torch.load(fp8, weights_only=False, map_location=device)
-            fp8_transformer.eval()
-            pipe.transformer = fp8_transformer
-        except Exception as e:
-            print(f"Error loading FP8 transformer: {e}")
-            print("Falling back to default transformer")
+    print(f"  Final processing size: {width}x{height} ({current_pixels} pixels)")
+    
+    return init_image, width, height
 
+def process_single_image(input_path, output_path, pipe, pipe_prior_redux, prompt, redux, acceleration, strength, scale_down):
+    """Process a single image with the configured pipeline."""
+    try:
+        # Prepare the image
+        init_image, width, height = prepare_image(input_path, scale_down)
+        fname = os.path.basename(input_path)
+        
+        def callback(pipe, step, timestep, callback_kwargs):
+            latents = callback_kwargs.get("latents", None)
+            callback.step_pbar.update(1)
+            return {"latents": latents} if latents is not None else {}
+        
+        # Set the timesteps and strength for the inference
+        if redux:
+            # Redux always uses strength 1.0
+            effective_strength = 1.0
+        else:
+            # Use the provided strength parameter for img2img
+            effective_strength = strength
+            
+        if acceleration in ["alimama", "hyper"]:
+            desired_num_steps = 10
+        else:
+            desired_num_steps = 25
+            
+        # Calculate inference steps based on strength
+        num_inference_steps = desired_num_steps / effective_strength
+
+        # Detailer Daemon
+        pipe.scheduler.set_sigmas = LyingSigmaSampler(
+            dishonesty_factor=-0.05,
+            start_percent=0.1,
+            end_percent=0.9
+        )
+
+        with torch.no_grad():
+            if redux:
+                pipe_prior_output = pipe_prior_redux(image=init_image)
+                num_images = 1
+            else:
+                num_images = 1
+                
+            with tqdm(total=desired_num_steps, desc=f"Steps for {fname}", leave=True) as step_pbar:
+                callback.step_pbar = step_pbar
+                if redux:
+                    result = pipe(
+                        guidance_scale=2.5,
+                        num_inference_steps=int(num_inference_steps),
+                        height=height,
+                        width=width,                                
+                        **pipe_prior_output,
+                        callback_on_step_end=callback
+                    ).images
+                else:
+                    result = pipe(
+                        prompt=prompt,
+                        image=init_image,
+                        num_inference_steps=int(num_inference_steps),
+                        strength=effective_strength,
+                        guidance_scale=3.0,
+                        height=height,
+                        width=width,
+                        num_images_per_prompt=num_images,
+                        callback_on_step_end=callback
+                    ).images
+
+            # Saving images with appropriate filenames
+            if len(result) > 1:
+                # If multiple images, add suffixes
+                for idx, img in enumerate(result):
+                    output_image_path = f"{output_path.rstrip('.png')}_{str(idx + 1).zfill(4)}.png"
+                    img.save(output_image_path)
+            else:
+                # If only one image, save normally
+                result[0].save(output_path)
+                
+        return True
+    except Exception as e:
+        print(f"Error processing {os.path.basename(input_path)}: {e}")
+        return False
+
+def get_files_to_process(input_dir, output_dir):
+    """Get the list of files that need to be processed."""
     # Check if input_dir is a file or directory
     if os.path.isfile(input_dir):
         # If input_dir is a file, extract its directory and filename separately
-        input_dir, filename = os.path.split(input_dir)
+        input_dir_path, filename = os.path.split(input_dir)
         png_files = [filename]  # Store only the filename
+        input_dir = input_dir_path  # Update input_dir to be the directory
     elif os.path.isdir(input_dir):
-        # If input_dir is a directory, leave the code as it was originally.
+        # If input_dir is a directory, get all PNG files
         png_files = sorted([f for f in os.listdir(input_dir) if f.lower().endswith('.png')])
     else:
         raise ValueError("Input must be either a file or a directory.")
 
     # Create a list of files that need processing, excluding already processed files
     files_to_process = []
-    print(f"output_dir directory: {output_dir}")
+    print(f"Output directory: {output_dir}")
     
     for f in png_files:
         filename = os.path.basename(f)  # Extract only the filename
         output_path = os.path.join(output_dir, filename)  # Output path is based on the filename
         print(f"Output path: {output_path}")
         if not os.path.exists(output_path):
-            files_to_process.append(f)  # Only add files that don’t exist in the output directory
+            files_to_process.append(f)  # Only add files that don't exist in the output directory
         else:
-            print(f"Skipping {f}: already exists in output directory.")  # Debugging line
+            print(f"Skipping {f}: already exists in output directory.")
 
     # Debug: print the number of files that need processing
     print(f"Total files to process: {len(files_to_process)}")
-    print(f"Scale_down flag: {scale_down}")
+    
+    return input_dir, files_to_process
 
-    total_files_to_process = len(files_to_process)
+def process_directory(input_dir, output_dir, acceleration, redux, prompt, fp8, lora_file, scale_down=False, strength=0.20):
+    """Process all images in a directory with the specified parameters."""
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Setup the pipeline
+    pipe, pipe_prior_redux = setup_pipeline(redux, acceleration, lora_file, fp8)
+    
+    # Get files to process
+    input_dir, files_to_process = get_files_to_process(input_dir, output_dir)
+    
+    # Process each file
+    with tqdm(total=len(files_to_process), desc="Processing images", unit="img") as main_pbar:
+        for filename in files_to_process:
+            input_path = os.path.join(input_dir, filename)
+            output_path = os.path.join(output_dir, filename)
+            
+            success = process_single_image(
+                input_path, 
+                output_path, 
+                pipe, 
+                pipe_prior_redux, 
+                prompt, 
+                redux, 
+                acceleration, 
+                strength,
+                scale_down
+            )
+            
+            main_pbar.update(1)
 
-    with tqdm(total=total_files_to_process, desc="Processing images", unit="img") as main_pbar:
-        # Create the list of input files and output file paths for only the files to process
-        input_files = [os.path.join(input_dir, filename) for filename in files_to_process]
-        output_files = {filename: os.path.join(output_dir, filename) for filename in files_to_process}
-
-        # Process each file
-        for input_path in input_files:
-            fname = os.path.basename(input_path)
-            output_path = output_files[fname]
-
-            try:
-                # Process the image file
-                init_image = load_image(input_path)
-
-                # Debug scale-down process thoroughly
-                print(f"\nProcessing {fname}:")
-                # Apply scale down if requested
-                if scale_down:
-                    width, height = init_image.size
-                    pixel_count = width * height
-                    print(f"  Original size: {width}x{height} ({pixel_count} pixels)")
-                    if  pixel_count > 1_500_000:  # Between 1.5MP and 2.2MP, scale down 2x
-                        init_image = upscale_to_sdxl(input_path)
-                    else:
-                        print(f"  Image below 1.5MP, no scaling applied")
-                    width, height = init_image.size  # Update dimensions after resize
-                    print(f"  Size after resize: {width}x{height} ({width * height} pixels)")
-                    
-                width, height = init_image.size  # Ensure we use the latest dimensions
-                # Add your image processing logic here
-                current_pixels = width * height                    
-                # If image is already 1MP or larger, return original
-                if current_pixels <= 1_000_000:
-                    print(f"  Image below 1Mpixel, scaling up to nearest SDXL resolution")
-                    init_image = upscale_to_sdxl(input_path)
-                    width, height = init_image.size       
-
-                print(f"  Final processing size: {width}x{height} ({current_pixels} pixels)")
-
-                def callback(pipe, step, timestep, callback_kwargs):
-                    latents = callback_kwargs.get("latents", None)
-                    callback.step_pbar.update(1)
-                    return {"latents": latents} if latents is not None else {}  # Ensure a valid return type
-
-                # Set the timesteps and strength for the inference
-                if redux:
-                    strength = 1.0
-                else:
-                    strength = 0.20
-                if acceleration in ["alimama", "hyper"]:
-                    desired_num_steps = 10
-                else:
-                    desired_num_steps = 25
-                # see https://huggingface.co/docs/diffusers/api/pipelines/flux#diffusers.FluxImg2ImgPipeline for more details
-                num_inference_steps = desired_num_steps / strength
-
-                # Detailer Daemon
-                pipe.scheduler.set_sigmas = LyingSigmaSampler(
-                    dishonesty_factor=-0.05,
-                    start_percent=0.1,
-                    end_percent=0.9
-                )
-
-                with torch.no_grad():  # Add this context manager
-                    if redux:
-                        pipe_prior_output = pipe_prior_redux(image=init_image)
-                        num_images = 1
-                    else:
-                        num_images = 1
-                    with tqdm(total=desired_num_steps, desc=f"Steps for {fname}", leave=True) as step_pbar:
-                        callback.step_pbar = step_pbar
-                        if redux:
-                            # print("Running redux")
-                            result = pipe(
-                                guidance_scale=2.5,
-                                num_inference_steps=int(num_inference_steps),
-                                height=height,
-                                width=width,                                
-                                # generator=torch.Generator("cpu").manual_seed(0),
-                                **pipe_prior_output,
-                                callback_on_step_end=callback
-                            ).images
-                        else:
-                            result = pipe(
-                                prompt=prompt,
-                                image=init_image,
-                                num_inference_steps=int(num_inference_steps),
-                                strength=strength,
-                                guidance_scale=3.0,
-                                height=height,
-                                width=width,
-                                num_images_per_prompt=num_images,
-                                callback_on_step_end=callback
-                            ).images
-
-                    # Saving images with appropriate filenames
-                    if len(result) > 1:
-                        # If multiple images, add suffixes
-                        for idx, img in enumerate(result):
-                            output_image_path = f"{output_path.rstrip('.png')}_{str(idx + 1).zfill(4)}.png"  # For example: image_0001.png
-                            img.save(output_image_path)
-                    else:
-                        # If only one image, save normally
-                        result[0].save(output_path)
-
-                main_pbar.update(1)                
-
-            except Exception as e:
-                print(f"Skipping {fname}: {e}")
 
 def upscale_to_sdxl(image_path):
     """
