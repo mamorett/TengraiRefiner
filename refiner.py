@@ -8,7 +8,7 @@ from PIL import Image
 from diffusers import FluxImg2ImgPipeline, FluxPriorReduxPipeline, FluxPipeline, FluxControlPipeline
 from tqdm import tqdm
 import datetime
-from transformers import CLIPTextModel, CLIPTokenizer, T5EncoderModel, T5TokenizerFast
+from transformers import CLIPTextModel, CLIPTokenizer, T5EncoderModel, T5TokenizerFast, AutoModelForCausalLM, AutoProcessor
 from diffusers import FlowMatchEulerDiscreteScheduler, AutoencoderKL
 from diffusers.models.transformers.transformer_flux import FluxTransformer2DModel
 from optimum.quanto import freeze, qfloat8, quantize
@@ -29,6 +29,9 @@ bfl_repo = "black-forest-labs/FLUX.1-dev"
 # revision = "main"
 repo_redux = "black-forest-labs/FLUX.1-Redux-dev"
 repo_depth = "black-forest-labs/FLUX.1-Depth-dev"
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
 
 class LyingSigmaSampler:
     def __init__(self, 
@@ -71,8 +74,29 @@ def prepare_repo(repo_name, revision="main"):
     return scheduler, text_encoder, tokenizer, text_encoder_2, tokenizer_2, vae, transformer
 
 
+def miaoshuai_tagger(image):
+    model = AutoModelForCausalLM.from_pretrained("MiaoshouAI/Florence-2-large-PromptGen-v2.0", trust_remote_code=True)
+    processor = AutoProcessor.from_pretrained("MiaoshouAI/Florence-2-large-PromptGen-v2.0", trust_remote_code=True)
+
+    prompt = "<MORE_DETAILED_CAPTION>"
+
+    inputs = processor(text=prompt, images=image, return_tensors="pt").to(device)
+
+    generated_ids = model.generate(
+        input_ids=inputs["input_ids"],
+        pixel_values=inputs["pixel_values"],
+        max_new_tokens=1024,
+        do_sample=False,
+        num_beams=3
+    )
+    generated_text = processor.batch_decode(generated_ids, skip_special_tokens=False)[0]
+
+    parsed_answer = processor.post_process_generation(generated_text, task=prompt, image_size=(image.width, image.height))
+
+    print(parsed_answer)
+    return parsed_answer
+
 def apply_loras(lorafile, pipe):
-    device = "cuda" if torch.cuda.is_available() else "cpu"
     if not lorafile:
         return pipe
 
@@ -92,7 +116,6 @@ def apply_loras(lorafile, pipe):
 
 def setup_pipeline(mode, acceleration, lora_file, fp8):
     """Set up and configure the appropriate pipeline based on parameters."""
-    device = "cuda" if torch.cuda.is_available() else "cpu"
     pipe_prior_redux = None
 
     if mode == "depth":
@@ -138,6 +161,9 @@ def setup_pipeline(mode, acceleration, lora_file, fp8):
         )        
 
     pipe.enable_model_cpu_offload()
+    pipe.enable_vae_slicing()
+    pipe.enable_attention_slicing(4)
+
     pipe.set_progress_bar_config(disable=True)
     
     # Apply LoRA before acceleration
@@ -261,6 +287,9 @@ def process_single_image(input_path, output_path, pipe, pipe_prior_redux, prompt
 
         # Calculate inference steps based on strength
         num_inference_steps = desired_num_steps / effective_strength
+
+        if prompt == "auto":
+            prompt = miaoshuai_tagger(init_image)
 
         # Detailer Daemon
         pipe.scheduler.set_sigmas = LyingSigmaSampler(
