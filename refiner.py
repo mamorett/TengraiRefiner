@@ -24,7 +24,6 @@ load_dotenv()
 torch.backends.cuda.enable_mem_efficient_sdp(True)
 dtype = torch.bfloat16
 bfl_repo = "black-forest-labs/FLUX.1-dev"
-# revision = "refs/pr/3"
 revision = "main"
 repo_redux = "black-forest-labs/FLUX.1-Redux-dev"
 
@@ -66,9 +65,26 @@ class LyingSigmaSampler:
 
         return model_wrapper(x, sigmas, **kwargs)
 
-def process_directory(input_dir, output_dir, acceleration, redux, prompt, fp8):
+def apply_loras(lorafile, pipe):
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    if not lorafile:
+        return pipe
+
+    with torch.device(device):
+        lora_name = os.path.basename(lorafile)
+        print(f"Applying LoRA: {lora_name}")
+        try:
+            pipe.load_lora_weights(lorafile, weight_name=lora_name, device=device)
+            pipe.fuse_lora(lora_scale=1.0)
+            pipe.unload_lora_weights()
+        except Exception as e:
+            print(f"Failed to apply LoRA {lora_name}: {str(e)}")
+    return pipe
+
+def process_directory(input_dir, output_dir, acceleration, redux, prompt, fp8, lora_file, scale_down=False):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     os.makedirs(output_dir, exist_ok=True)
+    
     if redux:
         pipe_prior_redux = FluxPriorReduxPipeline.from_pretrained(
             repo_redux, 
@@ -99,6 +115,11 @@ def process_directory(input_dir, output_dir, acceleration, redux, prompt, fp8):
     pipe.enable_model_cpu_offload()
     pipe.set_progress_bar_config(disable=True)
 
+    # Apply LoRA before acceleration
+    if lora_file:
+        pipe = apply_loras(lora_file, pipe)
+
+    # Apply acceleration
     if acceleration == "hyper":
         repo_name = "ByteDance/Hyper-SD"
         ckpt_name = "Hyper-FLUX.1-dev-8steps-lora.safetensors"
@@ -123,98 +144,77 @@ def process_directory(input_dir, output_dir, acceleration, redux, prompt, fp8):
             print(f"Error loading FP8 transformer: {e}")
             print("Falling back to default transformer")
 
-    # Check if input_dir is a file or directory
+    # Handle input as file or directory
     if os.path.isfile(input_dir):
-        # If input_dir is a file, extract its directory and filename separately
         input_dir, filename = os.path.split(input_dir)
-        png_files = [filename]  # Store only the filename
+        png_files = [filename]
     elif os.path.isdir(input_dir):
-        # If input_dir is a directory, leave the code as it was originally.
         png_files = sorted([f for f in os.listdir(input_dir) if f.lower().endswith('.png')])
     else:
         raise ValueError("Input must be either a file or a directory.")
 
-    # Create a list of files that need processing, excluding already processed files
     files_to_process = []
-    print (f"output_dir directory: {output_dir}")
-    
     for f in png_files:
-        filename = os.path.basename(f)  # Extract only the filename
-        output_path = os.path.join(output_dir, filename)  # Output path is based on the filename
-        print (f"Output path: {output_path}")
+        output_path = os.path.join(output_dir, os.path.basename(f))
         if not os.path.exists(output_path):
-            files_to_process.append(f)  # Only add files that don't exist in the output directory
-        else:
-            print(f"Skipping {f}: already exists in output directory.")  # Debugging line
+            files_to_process.append(f)
 
-    # Debug: print the number of files that need processing
     print(f"Total files to process: {len(files_to_process)}")
 
-    total_files_to_process = len(files_to_process)
-
-    with tqdm(total=total_files_to_process, desc="Processing images", unit="img") as main_pbar:
-        # Create the list of input files and output file paths for only the files to process
+    with tqdm(total=len(files_to_process), desc="Processing images", unit="img") as main_pbar:
         input_files = [os.path.join(input_dir, filename) for filename in files_to_process]
         output_files = {filename: os.path.join(output_dir, filename) for filename in files_to_process}
 
-        # Process each file
         for input_path in input_files:
             fname = os.path.basename(input_path)
             output_path = output_files[fname]
 
             try:
-                # Process the image file
-                # init_image = Image.open(input_path).convert("RGB")
                 init_image = load_image(input_path)
                 width, height = init_image.size
-                # Add your image processing logic here
                 current_pixels = width * height
-                
-                # If image is already 1MP or larger, return original
+
+                # Scale down only if above 1.5 megapixels
+                if scale_down and current_pixels > 1_500_000:
+                    new_width = width // 2
+                    new_height = height // 2
+                    init_image = init_image.resize((new_width, new_height), Image.LANCZOS)
+                    width, height = init_image.size
+
                 if current_pixels <= 1_000_000:
-                    init_image=upscale_to_sdxl(input_path)
+                    init_image = upscale_to_sdxl(input_path)
                     width, height = init_image.size       
 
                 def callback(pipe, step, timestep, callback_kwargs):
                     latents = callback_kwargs.get("latents", None)
                     callback.step_pbar.update(1)
-                    return {"latents": latents} if latents is not None else {}  # Ensure a valid return type
+                    return {"latents": latents} if latents is not None else {}
 
-                # Set the timesteps and strength for the inference
-                if redux:
-                    strength = 1.0
-                else:
-                    strength = 0.20
-                if acceleration in ["alimama", "hyper"]:
-                    desired_num_steps = 10
-                else:
-                    desired_num_steps = 25
-                # see https://huggingface.co/docs/diffusers/api/pipelines/flux#diffusers.FluxImg2ImgPipeline for more details
+                strength = 1.0 if redux else 0.20
+                desired_num_steps = 10 if acceleration in ["alimama", "hyper"] else 25
                 num_inference_steps = desired_num_steps / strength
 
-                # Detailer Daemon
                 pipe.scheduler.set_sigmas = LyingSigmaSampler(
                     dishonesty_factor=-0.05,
                     start_percent=0.1,
                     end_percent=0.9
                 )
 
-                with torch.no_grad():  # Add this context manager
+                with torch.no_grad():
                     if redux:
                         pipe_prior_output = pipe_prior_redux(image=init_image)
                         num_images = 1
                     else:
                         num_images = 1
+                    
                     with tqdm(total=desired_num_steps, desc=f"Steps for {fname}", leave=True) as step_pbar:
                         callback.step_pbar = step_pbar
                         if redux:
-                            # print("Running redux")
                             result = pipe(
                                 guidance_scale=2.5,
                                 num_inference_steps=int(num_inference_steps),
                                 height=height,
-                                width=width,                                
-                                # generator=torch.Generator("cpu").manual_seed(0),
+                                width=width,
                                 **pipe_prior_output,
                                 callback_on_step_end=callback
                             ).images
@@ -231,129 +231,60 @@ def process_directory(input_dir, output_dir, acceleration, redux, prompt, fp8):
                                 callback_on_step_end=callback
                             ).images
 
-                    # Saving images with appropriate filenames
                     if len(result) > 1:
-                        # If multiple images, add suffixes
                         for idx, img in enumerate(result):
-                            output_image_path = f"{output_path.rstrip('.png')}_{str(idx + 1).zfill(4)}.png"  # For example: image_0001.png
+                            output_image_path = f"{output_path.rstrip('.png')}_{str(idx + 1).zfill(4)}.png"
                             img.save(output_image_path)
                     else:
-                        # If only one image, save normally
                         result[0].save(output_path)
 
-                main_pbar.update(1)                
+                main_pbar.update(1)
 
             except Exception as e:
                 print(f"Skipping {fname}: {e}")
 
-
 def upscale_to_sdxl(image_path):
-    """
-    Upscale image to nearest SDXL resolution (maintaining aspect ratio) if below 1 megapixel.
-    Common SDXL resolutions: 1024x1024, 1024x576, 576x1024, 1152x896, 896x1152, etc.
-    
-    Args:
-        image_path (str): Path to input image
-    
-    Returns:
-        PIL.Image: Resized image object
-    """
-    # Open the image
     img = Image.open(image_path)
-    
-    # Get current dimensions
     width, height = img.size
-    
-    # Calculate aspect ratio
     aspect_ratio = width / height
     
-    # SDXL base sizes to consider
     sdxl_sizes = [
-        (1024, 1024),  # 1:1
-        (1024, 576),   # 16:9
-        (576, 1024),   # 9:16
-        (1152, 896),   # 9:7
-        (896, 1152),   # 7:9
-        (1024, 768),   # 4:3
-        (768, 1024),   # 3:4
-        (1216, 832),   # Additional sizes
-        (832, 1216),
-        (1344, 768),
-        (768, 1344),
-        (1536, 640),
-        (866, 1155),        
-        (640, 1536)
+        (1024, 1024), (1024, 576), (576, 1024), (1152, 896), (896, 1152),
+        (1024, 768), (768, 1024), (1216, 832), (832, 1216), (1344, 768),
+        (768, 1344), (1536, 640), (866, 1155), (640, 1536)
     ]
     
-    # Filter out sizes that are smaller than 1 megapixel
     sdxl_sizes = [(w, h) for w, h in sdxl_sizes if w * h >= 1000000]
     
-    # Find the best matching SDXL resolution
-    best_size = None
-    min_ratio_diff = float('inf')
-    
-    for w, h in sdxl_sizes:
-        current_ratio = w / h
-        ratio_diff = abs(current_ratio - aspect_ratio)
-        
-        if ratio_diff < min_ratio_diff:
-            min_ratio_diff = ratio_diff
-            best_size = (w, h)
-    
-    # Resize image using LANCZOS resampling (high quality)
-    resized_img = img.resize(best_size, Image.LANCZOS)   
-    return resized_img
-
+    best_size = min(sdxl_sizes, key=lambda size: abs((size[0]/size[1]) - aspect_ratio))
+    return img.resize(best_size, Image.LANCZOS)
 
 def main():
     parser = argparse.ArgumentParser(description="Process PNG files.")
-    parser.add_argument('path', type=str, 
-                        help='The path of the directory to process')
-
-    parser.add_argument('--acceleration', '-a', type=str,
-                        choices=['alimama', 'hyper', 'none'],
-                        default='none',
-                        help='Acceleration LORA. Available options are Alimama Turbo or ByteDance Hyper (alimama|hyper) with 10 steps. If not provided, flux with 25 steps will be used.')
-    
-    parser.add_argument('--prompt', '-p', type=str,
-                    default='Very detailed, masterpiece quality',
-                    help='Set a custom prompts, if not defined defaults to Very detailed, masterpiece quality')
-    
-    parser.add_argument('--redux', '-r', action='store_true',
-                        help="Use redux instead of img2img")           
-
-    parser.add_argument('--load-fp8', '-q', type=str,
-                        help="Use a local FP8 quantized transformer model")  
-
-    # Create mutually exclusive group
-    group = parser.add_mutually_exclusive_group()
-    group.add_argument('--output_dir', '-o', type=str,
-                       help='Optional output directory. If not provided, outputs will be placed in current directory.')
-
-    group.add_argument('--subdir', '-s', type=str,
-                       help='Use subdir output directory. It will save all files in the specified subdirectory of the given path.')
+    parser.add_argument('path', type=str, help='The path of the directory or file to process')
+    parser.add_argument('--acceleration', '-a', type=str, choices=['alimama', 'hyper', 'none'],
+                        default='none', help='Acceleration LORA: alimama|hyper (10 steps) or none (25 steps)')
+    parser.add_argument('--prompt', '-p', type=str, default='Very detailed, masterpiece quality',
+                        help='Custom prompt (default: "Very detailed, masterpiece quality")')
+    parser.add_argument('--redux', '-r', action='store_true', help="Use redux instead of img2img")
+    parser.add_argument('--load-fp8', '-q', type=str, help="Use a local FP8 quantized transformer model")
+    parser.add_argument('--scale-down', '-d', action='store_true',
+                        help="Scale down source image by 50% if above 1.5 megapixels")
+    parser.add_argument('--lora', '-l', type=str, help="Path to a LoRA file to apply")
+    parser.add_argument('--output_dir', '-o', type=str,
+                        help='Optional output directory (default: current directory)')
 
     args = parser.parse_args()
 
-    # Ensure `path` is either a file or directory
     if not os.path.exists(args.path):
         print(f"Error: {args.path} does not exist.")
         exit(1)
 
-    if not args.prompt:
-        args.prompt = 'Very detailed, masterpiece quality'
+    out_dir = args.output_dir if args.output_dir else os.getcwd()
+    print(f"Output directory: {out_dir}")
 
-    # Determine output directory
-    if args.subdir:
-        out_dir = os.path.join(args.path, args.subdir)
-    elif args.output_dir:
-        out_dir = args.output_dir
-    else:
-        out_dir = os.getcwd() # Default to current directory
-
-    print (f"Output directory: {out_dir}")
-
-    process_directory(args.path, out_dir, args.acceleration, args.redux, args.prompt, args.load_fp8)
+    process_directory(args.path, out_dir, args.acceleration, args.redux, args.prompt, 
+                     args.load_fp8, args.lora, args.scale_down)
 
 if __name__ == "__main__":
     main()
