@@ -84,7 +84,6 @@ def apply_loras(lorafile, pipe):
                 print(f"Failed to apply LoRA {lora_name}: {str(e)}")
                 # Continue with next LoRA even if one fails
     return pipe
-
 def process_directory(input_dir, output_dir, acceleration, redux, prompt, fp8, lora_file, scale_down=False):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     os.makedirs(output_dir, exist_ok=True)
@@ -172,6 +171,7 @@ def process_directory(input_dir, output_dir, acceleration, redux, prompt, fp8, l
 
     # Debug: print the number of files that need processing
     print(f"Total files to process: {len(files_to_process)}")
+    print(f"Scale_down flag: {scale_down}")
 
     total_files_to_process = len(files_to_process)
 
@@ -189,17 +189,34 @@ def process_directory(input_dir, output_dir, acceleration, redux, prompt, fp8, l
                 # Process the image file
                 init_image = load_image(input_path)
 
-                # Apply scale down if requested and above 1.5MP
+                # Debug scale-down process thoroughly
+                print(f"\nProcessing {fname}:")
+                # Apply scale down if requested
                 if scale_down:
                     width, height = init_image.size
-                    if width * height > 1_500_000:
+                    pixel_count = width * height
+                    print(f"  Original size: {width}x{height} ({pixel_count} pixels)")
+                    if pixel_count > 2_600_000:  # Above 2.2MP, scale down 4x
+                        new_width = width // 4
+                        new_height = height // 4
+                        print(f"  Scaling down 4x to: {new_width}x{new_height}")
+                        init_image = init_image.resize((new_width, new_height), Image.LANCZOS)
+                    elif pixel_count > 1_500_000:  # Between 1.5MP and 2.2MP, scale down 2x
                         new_width = width // 2
                         new_height = height // 2
+                        print(f"  Scaling down 2x to: {new_width}x{new_height}")
                         init_image = init_image.resize((new_width, new_height), Image.LANCZOS)
+                    else:
+                        print(f"  Image below 1.5MP, no scaling applied")
+                    width, height = init_image.size  # Update dimensions after resize
+                    print(f"  Size after resize: {width}x{height} ({width * height} pixels)")
+                # else:
+                #     print(f"  Scale-down not requested")
 
-                width, height = init_image.size
+                width, height = init_image.size  # Ensure we use the latest dimensions
                 # Add your image processing logic here
                 current_pixels = width * height
+                print(f"  Final processing size: {width}x{height} ({current_pixels} pixels)")
                 
                 # If image is already 1MP or larger, return original
                 if current_pixels <= 1_000_000:
