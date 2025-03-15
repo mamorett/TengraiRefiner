@@ -17,6 +17,7 @@ from huggingface_hub import hf_hub_download
 warnings.filterwarnings('ignore')
 import argparse
 from diffusers.utils import load_image
+from image_gen_aux import DepthPreprocessor
 
 load_dotenv()
 
@@ -25,16 +26,9 @@ torch.backends.cuda.enable_mem_efficient_sdp(True)
 dtype = torch.bfloat16
 bfl_repo = "black-forest-labs/FLUX.1-dev"
 # revision = "refs/pr/3"
-revision = "main"
+# revision = "main"
 repo_redux = "black-forest-labs/FLUX.1-Redux-dev"
-
-scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(bfl_repo, subfolder="scheduler", revision=revision)
-text_encoder = CLIPTextModel.from_pretrained("openai/clip-vit-large-patch14", torch_dtype=dtype)
-tokenizer = CLIPTokenizer.from_pretrained("openai/clip-vit-large-patch14", torch_dtype=dtype)
-text_encoder_2 = T5EncoderModel.from_pretrained(bfl_repo, subfolder="text_encoder_2", torch_dtype=dtype, revision=revision)
-tokenizer_2 = T5TokenizerFast.from_pretrained(bfl_repo, subfolder="tokenizer_2", torch_dtype=dtype, revision=revision)
-vae = AutoencoderKL.from_pretrained(bfl_repo, subfolder="vae", torch_dtype=dtype, revision=revision)
-transformer = FluxTransformer2DModel.from_pretrained(bfl_repo, subfolder="transformer", torch_dtype=dtype, revision=revision)
+repo_depth = "black-forest-labs/FLUX.1-Depth-dev"
 
 class LyingSigmaSampler:
     def __init__(self, 
@@ -66,6 +60,17 @@ class LyingSigmaSampler:
 
         return model_wrapper(x, sigmas, **kwargs)
 
+def prepare_repo(repo_name, revision="main"):
+    scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(repo_name, subfolder="scheduler", revision=revision)
+    text_encoder = CLIPTextModel.from_pretrained("openai/clip-vit-large-patch14", torch_dtype=dtype)
+    tokenizer = CLIPTokenizer.from_pretrained("openai/clip-vit-large-patch14", torch_dtype=dtype)
+    text_encoder_2 = T5EncoderModel.from_pretrained(repo_name, subfolder="text_encoder_2", torch_dtype=dtype, revision=revision)
+    tokenizer_2 = T5TokenizerFast.from_pretrained(repo_name, subfolder="tokenizer_2", torch_dtype=dtype, revision=revision)
+    vae = AutoencoderKL.from_pretrained(repo_name, subfolder="vae", torch_dtype=dtype, revision=revision)
+    transformer = FluxTransformer2DModel.from_pretrained(repo_name, subfolder="transformer", torch_dtype=dtype, revision=revision)
+    return scheduler, text_encoder, tokenizer, text_encoder_2, tokenizer_2, vae, transformer
+
+
 def apply_loras(lorafile, pipe):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     if not lorafile:
@@ -85,11 +90,16 @@ def apply_loras(lorafile, pipe):
                 # Continue with next LoRA even if one fails
     return pipe
 
-def setup_pipeline(redux, acceleration, lora_file, fp8):
+def setup_pipeline(mode, acceleration, lora_file, fp8):
     """Set up and configure the appropriate pipeline based on parameters."""
     device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    if mode == "depth":
+        scheduler, text_encoder, tokenizer, text_encoder_2, tokenizer_2, vae, transformer = prepare_repo(repo_depth, revision="main")
+    else:
+        scheduler, text_encoder, tokenizer, text_encoder_2, tokenizer_2, vae, transformer = prepare_repo(bfl_repo, revision="main")
     
-    if redux:
+    if mode=="redux":
         pipe_prior_redux = FluxPriorReduxPipeline.from_pretrained(
             repo_redux, 
             torch_dtype=dtype
@@ -106,7 +116,7 @@ def setup_pipeline(redux, acceleration, lora_file, fp8):
             transformer=transformer,
         )
         return pipe, pipe_prior_redux
-    else:
+    elif mode=="refiner":
         pipe = FluxImg2ImgPipeline(
             scheduler=scheduler,
             text_encoder=text_encoder,
@@ -195,7 +205,7 @@ def prepare_image(input_path, scale_down=False):
     
     return init_image, width, height
 
-def process_single_image(input_path, output_path, pipe, pipe_prior_redux, prompt, redux, acceleration, strength, scale_down):
+def process_single_image(input_path, output_path, pipe, pipe_prior_redux, prompt, mode, acceleration, strength, scale_down):
     """
     Process a single image with the configured pipeline.
     Args:
@@ -222,7 +232,7 @@ def process_single_image(input_path, output_path, pipe, pipe_prior_redux, prompt
             return {"latents": latents} if latents is not None else {}
         
         # Set the timesteps and strength for the inference
-        if redux:
+        if mode == "redux" or mode == "depth":
             # Redux always uses strength 1.0
             effective_strength = 1.0
         else:
@@ -234,6 +244,10 @@ def process_single_image(input_path, output_path, pipe, pipe_prior_redux, prompt
         else:
             desired_num_steps = 25
             
+        if mode == "depth":
+            processor = DepthPreprocessor.from_pretrained("LiheYoung/depth-anything-large-hf")
+            control_image = processor(init_image)[0].convert("RGB")
+
         # Calculate inference steps based on strength
         num_inference_steps = desired_num_steps / effective_strength
 
@@ -245,7 +259,7 @@ def process_single_image(input_path, output_path, pipe, pipe_prior_redux, prompt
         )
 
         with torch.no_grad():
-            if redux:
+            if mode=="redux":
                 pipe_prior_output = pipe_prior_redux(image=init_image)
                 num_images = 1
             else:
@@ -253,7 +267,7 @@ def process_single_image(input_path, output_path, pipe, pipe_prior_redux, prompt
                 
             with tqdm(total=desired_num_steps, desc=f"Steps for {fname}", leave=True) as step_pbar:
                 callback.step_pbar = step_pbar
-                if redux:
+                if mode == "redux":
                     result = pipe(
                         guidance_scale=2.5,
                         num_inference_steps=int(num_inference_steps),
@@ -262,7 +276,7 @@ def process_single_image(input_path, output_path, pipe, pipe_prior_redux, prompt
                         **pipe_prior_output,
                         callback_on_step_end=callback
                     ).images
-                else:
+                elif mode == "refiner":
                     result = pipe(
                         prompt=prompt,
                         image=init_image,
@@ -274,6 +288,17 @@ def process_single_image(input_path, output_path, pipe, pipe_prior_redux, prompt
                         num_images_per_prompt=num_images,
                         callback_on_step_end=callback
                     ).images
+                else:
+                    result = pipe(
+                        prompt=prompt,
+                        control_image=control_image,
+                        num_inference_steps=int(num_inference_steps),
+                        guidance_scale=10.0,
+                        height=height,
+                        width=width,
+                        num_images_per_prompt=num_images,
+                        callback_on_step_end=callback
+                    ).images                 
 
             # Saving images with appropriate filenames
             if len(result) > 1:
@@ -336,7 +361,7 @@ def get_files_to_process(input_dir, output_dir):
     
     return input_dir, files_to_process
 
-def process_directory(input_dir, output_dir, acceleration, redux, prompt, fp8, lora_file, scale_down=False, strength=0.20):
+def process_directory(input_dir, output_dir, acceleration, mode, prompt, fp8, lora_file, scale_down=False, strength=0.20):
     """
     Process all images in a directory with the specified parameters.
     Args:
@@ -355,7 +380,7 @@ def process_directory(input_dir, output_dir, acceleration, redux, prompt, fp8, l
     os.makedirs(output_dir, exist_ok=True)
     
     # Setup the pipeline
-    pipe, pipe_prior_redux = setup_pipeline(redux, acceleration, lora_file, fp8)
+    pipe, pipe_prior_redux = setup_pipeline(mode, acceleration, lora_file, fp8)
     
     # Get files to process
     input_dir, files_to_process = get_files_to_process(input_dir, output_dir)
@@ -372,7 +397,7 @@ def process_directory(input_dir, output_dir, acceleration, redux, prompt, fp8, l
                 pipe, 
                 pipe_prior_redux, 
                 prompt, 
-                redux, 
+                mode, 
                 acceleration, 
                 strength,
                 scale_down
@@ -451,9 +476,11 @@ def main():
     parser.add_argument('--prompt', '-p', type=str,
                     default='Very detailed, masterpiece quality',
                     help='Set a custom prompts, if not defined defaults to Very detailed, masterpiece quality')
-    
-    parser.add_argument('--redux', '-r', action='store_true',
-                        help="Use redux instead of img2img")           
+
+    parser.add_argument('--mode', '-m', type=str,
+                    choices=['refiner', 'redux', 'depth'],
+                    default='refiner',
+                    help='Set mode of operation (refiner|redux|depth), if not defined defaults to refiner')     
 
     parser.add_argument('--load-fp8', '-q', type=str,
                         help="Use a local FP8 quantized transformer model")  
@@ -488,7 +515,7 @@ def main():
 
     print(f"Output directory: {out_dir}")
 
-    process_directory(args.path, out_dir, args.acceleration, args.redux, args.prompt, args.load_fp8, args.lora, args.scale_down, args.denoise)
+    process_directory(args.path, out_dir, args.acceleration, args.mode, args.prompt, args.load_fp8, args.lora, args.scale_down, args.denoise)
     
 if __name__ == "__main__":
     main()
