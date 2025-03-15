@@ -1,14 +1,14 @@
 <div align="center">
 <pre>
-██████ ██████ ██   ██  ████  ██████   ██   ██████ ██████ ██████ ██████ ██████ ██   ██ ██████ ██████ 
-  ██   ██     ███  ██ ██     ██  ██  ████    ██   ██  ██ ██     ██       ██   ███  ██ ██     ██  ██ 
-  ██   ████   ██ █ ██ ██ ███ ██████ ██  ██   ██   ██████ ████   ████     ██   ██ █ ██ ████   ██████ 
-  ██   ██     ██  ███ ██  ██ ██ ██  ██████   ██   ██ ██  ██     ██       ██   ██  ███ ██     ██ ██  
-  ██   ██████ ██   ██  ████  ██  ██ ██  ██ ██████ ██  ██ ██████ ██     ██████ ██   ██ ██████ ██  ██ 
+████████ ███████ ███    ██  ██████  ██████   █████  ██ ██████  ███████ ███████ ██ ███    ██ ███████ ██████  
+   ██    ██      ████   ██ ██       ██   ██ ██   ██ ██ ██   ██ ██      ██      ██ ████   ██ ██      ██   ██ 
+   ██    █████   ██ ██  ██ ██   ███ ██████  ███████ ██ ██████  █████   █████   ██ ██ ██  ██ █████   ██████  
+   ██    ██      ██  ██ ██ ██    ██ ██   ██ ██   ██ ██ ██   ██ ██      ██      ██ ██  ██ ██ ██      ██   ██ 
+   ██    ███████ ██   ████  ██████  ██   ██ ██   ██ ██ ██   ██ ███████ ██      ██ ██   ████ ███████ ██   ██ 
 </pre>
 </div>
 <p align="center">
-	<em><code>❯ REPLACE-ME</code></em>
+	<em><code>❯ Enhance your images with FLUX.1 models</code></em>
 </p>
 <p align="center">
 	<img src="https://img.shields.io/github/license/mamorett/TengraiRefiner?style=flat-square&logo=opensourceinitiative&logoColor=white&color=8a2be2" alt="license">
@@ -20,10 +20,13 @@
 <p align="center">
 	<img src="https://img.shields.io/badge/tqdm-FFC107.svg?style=flat-square&logo=tqdm&logoColor=black" alt="tqdm">
 	<img src="https://img.shields.io/badge/Python-3776AB.svg?style=flat-square&logo=Python&logoColor=white" alt="Python">
+	<img src="https://img.shields.io/badge/FLUX-FFC107.svg?style=flat-square&logo=pytorch&logoColor=black" alt="FLUX">
+	<img src="https://img.shields.io/badge/PyTorch-EE4C2C.svg?style=flat-square&logo=PyTorch&logoColor=white" alt="PyTorch">
+	<img src="https://img.shields.io/badge/HuggingFace-FF9A00.svg?style=flat-square&logo=huggingface&logoColor=white" alt="HuggingFace">
 </p>
 <br>
 
-##  Table of Contents
+## Table of Contents
 
 - [Table of Contents](#table-of-contents)
 - [Features](#features)
@@ -34,6 +37,7 @@
   - [Options](#options)
   - [Examples](#examples)
 - [Processing Details](#processing-details)
+- [Image Preparation](#image-preparation)
 - [Memory Optimization](#memory-optimization)
 - [Error Handling](#error-handling)
 - [Notes](#notes)
@@ -43,16 +47,20 @@
 - [Acknowledgments](#acknowledgments)
 
 ---
-TengraiRefiner is a Python script for batch processing images using FLUX models with optional acceleration via Alimama Turbo or ByteDance Hyper LORA adapters. It is meant mainly to act as refiner for images produced by Tengrai AI (www.tengrai.ai) but can be obivously used to enhance any image using Flux.dev.
+TengraiRefiner is a Python script for batch processing images using FLUX models with optional acceleration via Alimama Turbo or ByteDance Hyper LORA adapters. It is meant mainly to act as a refiner for images produced by Tengrai AI (www.tengrai.ai) but can be obviously used to enhance any image using Flux.dev models.
 
 ## Features
 
 - Support for both single image and batch processing
 - Compatible with FLUX.1-dev and FLUX.1-Redux-dev models
+- Intelligent image scaling to SDXL-compatible resolutions
 - Memory-efficient processing with automatic CPU offloading
-- Quantization support for optimal performance
-- Progress tracking with detailed step information
+- FP8 quantization support for optimal performance
+- Detailed progress tracking with per-step information
 - Configurable acceleration options (Alimama Turbo or ByteDance Hyper)
+- Custom LoRA support with ability to apply before acceleration
+- Adjustable denoise strength for refiner processing
+- Option to scale down large images for more efficient processing
 
 ## Prerequisites
 
@@ -94,11 +102,14 @@ python script.py <path> [options]
 
 ### Options
 
-- `-a, --acceleration`: Choose acceleration LORA (options: 'alimama' or 'hyper', default: 'alimama')
+- `-a, --acceleration`: Choose acceleration LORA (options: 'alimama', 'hyper', or 'none', default: 'none')
 - `-p, --prompt`: Set a custom prompt (default: 'Very detailed, masterpiece quality')
 - `-r, --redux`: Use redux instead of img2img
-- `-o, --output_dir`: Specify output directory (mutually exclusive with --subdir)
-- `-s, --subdir`: Save output in a subdirectory of the input path (mutually exclusive with --output_dir)
+- `-q, --load-fp8`: Use a local FP8 quantized transformer model
+- `-s, --scale-down`: Scale down the source image by 50% if above 1.5 megapixels
+- `-l, --lora`: Path to a LoRA file to apply before acceleration
+- `-d, --denoise`: Denoise strength for refine processing (default: 0.20)
+- `-o, --output_dir`: Specify output directory
 
 ### Examples
 
@@ -122,46 +133,67 @@ python script.py <path> [options]
    python script.py path/to/directory -r -a alimama
    ```
 
+5. Apply a custom LoRA and set denoise strength:
+   ```bash
+   python script.py path/to/directory -l path/to/lora.safetensors -d 0.30
+   ```
+
 ## Processing Details
 
-- Images are processed one at a time with progress tracking
+- Images are processed one at a time with comprehensive progress tracking
 - Default processing uses 25 inference steps (10 steps with acceleration)
-- Strength parameter is set to 0.20 for img2img and 1.0 for redux
+- Strength parameter is configurable via the `-d/--denoise` option (defaults to 0.20 for img2img and always 1.0 for redux)
 - Already processed images are skipped to avoid duplication
+- Custom LyingSigmaSampler for improved detail enhancement
 - Output maintains original image dimensions
+
+## Image Preparation
+
+The script includes intelligent image preparation:
+- Images smaller than 1 megapixel are automatically upscaled to the nearest SDXL resolution
+- Images larger than 1.5 megapixels can be scaled down (with the `-s/--scale-down` option)
+- Aspect ratio is preserved during scaling
+- Compatible with common SDXL resolutions (1024×1024, 1024×576, etc.)
 
 ## Memory Optimization
 
 The script includes several optimizations:
 - Memory-efficient attention for SD-based models
-- BFloat16 precision
-- Automatic CPU offloading
-- Transformer and text encoder quantization
-- Model freezing for reduced memory usage
+- BFloat16 precision by default
+- Automatic CPU offloading for components not actively in use
+- Transformer quantization via optimum-quanto for reduced VRAM usage
+- Option to load pre-quantized FP8 transformer models
+- Model freezing for reduced memory footprint
 
 ## Error Handling
 
 - Skips already processed images
-- Provides error messages for failed processing attempts
+- Provides detailed error messages for failed processing attempts
 - Validates input paths and arguments
 - Continues processing remaining images if one fails
+- Comprehensive debug output for troubleshooting
 
 ## Notes
 
 - Requires CUDA-capable GPU for optimal performance
-- Progress bars show both overall progress and per-image steps
+- Progress bars show both overall batch progress and per-image step progress
 - Environment variables can be configured via .env file
 - Original file names are preserved in output
+- For very large images, consider using the `-s/--scale-down` option
 
 ---
-##  Project Roadmap
+## Project Roadmap
 
 - [X] **`Task 1`**: <strike>Support Refiner mode and Redux mode</strike>
-- [ ] **`Task 2`**: Implement memory optimization for Redux.
+- [X] **`Task 2`**: <strike>Add support for custom LoRA files</strike>
+- [X] **`Task 3`**: <strike>Implement intelligent image scaling for optimal processing</strike>
+- [X] **`Task 4`**: <strike>Add FP8 quantization support</strike>
+- [ ] **`Task 5`**: Implement memory optimization for Redux
+- [ ] **`Task 6`**: Add batch size control for more efficient processing
 
 ---
 
-##  Contributing
+## Contributing
 
 - **💬 [Join the Discussions](https://github.com/mamorett/TengraiRefiner/discussions)**: Share your insights, provide feedback, or ask questions.
 - **🐛 [Report Issues](https://github.com/mamorett/TengraiRefiner/issues)**: Submit bugs found or log feature requests for the `TengraiRefiner` project.
@@ -170,7 +202,7 @@ The script includes several optimizations:
 <details closed>
 <summary>Contributing Guidelines</summary>
 
-1. **Fork the Repository**: Start by forking the project repository to your github account.
+1. **Fork the Repository**: Start by forking the project repository to your GitHub account.
 2. **Clone Locally**: Clone the forked repository to your local machine using a git client.
    ```sh
    git clone https://github.com/mamorett/TengraiRefiner
@@ -184,7 +216,7 @@ The script includes several optimizations:
    ```sh
    git commit -m 'Implemented new feature x.'
    ```
-6. **Push to github**: Push the changes to your forked repository.
+6. **Push to GitHub**: Push the changes to your forked repository.
    ```sh
    git push origin new-feature-x
    ```
@@ -196,7 +228,7 @@ The script includes several optimizations:
 <summary>Contributor Graph</summary>
 <br>
 <p align="left">
-   <a href="https://github.com{/mamorett/TengraiRefiner/}graphs/contributors">
+   <a href="https://github.com/mamorett/TengraiRefiner/graphs/contributors">
       <img src="https://contrib.rocks/image?repo=mamorett/TengraiRefiner">
    </a>
 </p>
@@ -204,14 +236,17 @@ The script includes several optimizations:
 
 ---
 
-##  License
+## License
 
 This project is protected under the [GNU GPLv3](https://choosealicense.com/licenses/gpl-3.0/) License. For more details, refer to the [LICENSE](./LICENSE) file.
 
 ---
 
-##  Acknowledgments
+## Acknowledgments
 
-
+- [Black Forest Labs](https://flux.dev) for the FLUX.1 models
+- [Alimama Creative](https://huggingface.co/alimama-creative) for the FLUX.1-Turbo adapter
+- [ByteDance](https://huggingface.co/ByteDance) for the Hyper-SD acceleration adapter
+- [Tengrai AI](https://www.tengrai.ai) for the inspiration behind this refiner
 
 ---

@@ -152,6 +152,19 @@ def setup_pipeline(redux, acceleration, lora_file, fp8):
         return pipe, None
 
 def prepare_image(input_path, scale_down=False):
+    """
+    Prepare the input image with appropriate scaling.
+    Parameters:
+    input_path (str): The file path to the input image.
+    scale_down (bool): Flag to indicate whether to scale down the image if it exceeds a certain size. Default is False.
+    Returns:
+    tuple: A tuple containing the processed image, its width, and its height.
+    The function performs the following steps:
+    1. Loads the image from the given input path.
+    2. If scale_down is True, checks the image size and scales it down if it exceeds 1.5 million pixels.
+    3. Ensures the image is at least 1 million pixels by scaling it up if necessary.
+    4. Returns the processed image along with its width and height.
+    """
     """Prepare the input image with appropriate scaling."""
     init_image = load_image(input_path)
     fname = os.path.basename(input_path)
@@ -183,7 +196,21 @@ def prepare_image(input_path, scale_down=False):
     return init_image, width, height
 
 def process_single_image(input_path, output_path, pipe, pipe_prior_redux, prompt, redux, acceleration, strength, scale_down):
-    """Process a single image with the configured pipeline."""
+    """
+    Process a single image with the configured pipeline.
+    Args:
+        input_path (str): Path to the input image.
+        output_path (str): Path to save the processed image.
+        pipe (Pipeline): The main image processing pipeline.
+        pipe_prior_redux (Pipeline): The pipeline used for redux processing.
+        prompt (str): The prompt for image generation.
+        redux (bool): Flag to indicate if redux processing should be used.
+        acceleration (str): Type of acceleration to be used ('alimama', 'hyper', etc.).
+        strength (float): Strength parameter for img2img processing.
+        scale_down (float): Factor to scale down the input image.
+    Returns:
+        bool: True if processing was successful, False otherwise.
+    """
     try:
         # Prepare the image
         init_image, width, height = prepare_image(input_path, scale_down)
@@ -264,7 +291,21 @@ def process_single_image(input_path, output_path, pipe, pipe_prior_redux, prompt
         return False
 
 def get_files_to_process(input_dir, output_dir):
-    """Get the list of files that need to be processed."""
+    """
+    Get the list of PNG files that need to be processed from the input directory.
+    This function checks whether the input path is a file or a directory. If it is a file,
+    it extracts the directory and filename separately. If it is a directory, it retrieves
+    all PNG files within it. The function then compares the list of PNG files with the
+    output directory to determine which files need to be processed (i.e., files that do
+    not already exist in the output directory).
+    Args:
+        input_dir (str): The path to the input directory or file.
+        output_dir (str): The path to the output directory.
+    Returns:
+        tuple: A tuple containing the input directory path and a list of files to process.
+    Raises:
+        ValueError: If the input path is neither a file nor a directory.
+    """
     # Check if input_dir is a file or directory
     if os.path.isfile(input_dir):
         # If input_dir is a file, extract its directory and filename separately
@@ -296,7 +337,21 @@ def get_files_to_process(input_dir, output_dir):
     return input_dir, files_to_process
 
 def process_directory(input_dir, output_dir, acceleration, redux, prompt, fp8, lora_file, scale_down=False, strength=0.20):
-    """Process all images in a directory with the specified parameters."""
+    """
+    Process all images in a directory with the specified parameters.
+    Args:
+        input_dir (str): The directory containing input images.
+        output_dir (str): The directory where processed images will be saved.
+        acceleration (bool): Flag to enable or disable acceleration.
+        redux (bool): Flag to enable or disable redux mode.
+        prompt (str): The prompt to be used for processing images.
+        fp8 (bool): Flag to enable or disable FP8 precision.
+        lora_file (str): Path to the LoRA file to be used.
+        scale_down (bool, optional): Flag to enable or disable scaling down of images. Defaults to False.
+        strength (float, optional): The strength of the processing effect. Defaults to 0.20.
+    Returns:
+        None
+    """
     os.makedirs(output_dir, exist_ok=True)
     
     # Setup the pipeline
@@ -404,12 +459,16 @@ def main():
                         help="Use a local FP8 quantized transformer model")  
 
     # Add new scale-down option
-    parser.add_argument('--scale-down', '-d', action='store_true',
+    parser.add_argument('--scale-down', '-s', action='store_true',
                         help="Scale down the source image by 50% before processing if above 1.5 megapixels")
 
     # Add LoRA option
     parser.add_argument('--lora', '-l', type=str,
                         help="Path to a LoRA file to apply before acceleration")
+
+    # Add denoise option
+    parser.add_argument('--denoise', '-d', type=float,
+                        help="Denoise strength for refine processing")                        
 
     parser.add_argument('--output_dir', '-o', type=str,
                        help='Optional output directory. If not provided, outputs will be placed in current directory.')
@@ -429,7 +488,7 @@ def main():
 
     print(f"Output directory: {out_dir}")
 
-    process_directory(args.path, out_dir, args.acceleration, args.redux, args.prompt, args.load_fp8, args.lora, args.scale_down)
+    process_directory(args.path, out_dir, args.acceleration, args.redux, args.prompt, args.load_fp8, args.lora, args.scale_down, args.denoise)
     
 if __name__ == "__main__":
     main()
