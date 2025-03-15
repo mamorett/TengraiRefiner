@@ -93,6 +93,7 @@ def apply_loras(lorafile, pipe):
 def setup_pipeline(mode, acceleration, lora_file, fp8):
     """Set up and configure the appropriate pipeline based on parameters."""
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    pipe_prior_redux = None
 
     if mode == "depth":
         scheduler, text_encoder, tokenizer, text_encoder_2, tokenizer_2, vae, transformer = prepare_repo(repo_depth, revision="main")
@@ -115,9 +116,7 @@ def setup_pipeline(mode, acceleration, lora_file, fp8):
             vae=vae,
             transformer=transformer,
         )
-        return pipe, pipe_prior_redux
     elif mode=="refiner":
-        pipe_prior_redux = None
         pipe = FluxImg2ImgPipeline(
             scheduler=scheduler,
             text_encoder=text_encoder,
@@ -128,7 +127,6 @@ def setup_pipeline(mode, acceleration, lora_file, fp8):
             transformer=transformer,
         )
     else:
-        pipe_prior_redux = None
         pipe = FluxControlPipeline(
             scheduler=scheduler,
             text_encoder=text_encoder,
