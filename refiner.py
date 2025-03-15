@@ -196,32 +196,23 @@ def process_directory(input_dir, output_dir, acceleration, redux, prompt, fp8, l
                     width, height = init_image.size
                     pixel_count = width * height
                     print(f"  Original size: {width}x{height} ({pixel_count} pixels)")
-                    if pixel_count > 2_600_000:  # Above 2.2MP, scale down 4x
-                        new_width = width // 4
-                        new_height = height // 4
-                        print(f"  Scaling down 4x to: {new_width}x{new_height}")
-                        init_image = init_image.resize((new_width, new_height), Image.LANCZOS)
-                    elif pixel_count > 1_500_000:  # Between 1.5MP and 2.2MP, scale down 2x
-                        new_width = width // 2
-                        new_height = height // 2
-                        print(f"  Scaling down 2x to: {new_width}x{new_height}")
-                        init_image = init_image.resize((new_width, new_height), Image.LANCZOS)
+                    if  pixel_count > 1_500_000:  # Between 1.5MP and 2.2MP, scale down 2x
+                        init_image = upscale_to_sdxl(input_path)
                     else:
                         print(f"  Image below 1.5MP, no scaling applied")
                     width, height = init_image.size  # Update dimensions after resize
                     print(f"  Size after resize: {width}x{height} ({width * height} pixels)")
-                # else:
-                #     print(f"  Scale-down not requested")
-
+                    
                 width, height = init_image.size  # Ensure we use the latest dimensions
                 # Add your image processing logic here
-                current_pixels = width * height
-                print(f"  Final processing size: {width}x{height} ({current_pixels} pixels)")
-                
+                current_pixels = width * height                    
                 # If image is already 1MP or larger, return original
                 if current_pixels <= 1_000_000:
+                    print(f"  Image below 1Mpixel, scaling up to nearest SDXL resolution")
                     init_image = upscale_to_sdxl(input_path)
                     width, height = init_image.size       
+
+                print(f"  Final processing size: {width}x{height} ({current_pixels} pixels)")
 
                 def callback(pipe, step, timestep, callback_kwargs):
                     latents = callback_kwargs.get("latents", None)
