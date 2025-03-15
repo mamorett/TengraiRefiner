@@ -66,7 +66,25 @@ class LyingSigmaSampler:
 
         return model_wrapper(x, sigmas, **kwargs)
 
-def process_directory(input_dir, output_dir, acceleration, redux, prompt, fp8):
+def apply_loras(lorafile, pipe):
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    if not lorafile:
+        return pipe
+
+    # Apply each LoRA sequentially, ensuring weights are loaded on the GPU
+    with torch.device(device):
+        if lorafile:
+            lora_name = os.path.basename(lorafile)  # Extract only the filename
+            print(f"Applying LoRA: {lora_name}")
+            try:
+                pipe.load_lora_weights(lorafile, weight_name=lora_name, device=device)  # Load LoRA on GPU
+                pipe.fuse_lora(lora_scale=1.0)  # Adjust scale as needed
+                pipe.unload_lora_weights()  # Clean up immediately
+            except Exception as e:
+                print(f"Failed to apply LoRA {lora_name}: {str(e)}")
+                # Continue with next LoRA even if one fails
+    return pipe
+def process_directory(input_dir, output_dir, acceleration, redux, prompt, fp8, lora_file, scale_down=False):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     os.makedirs(output_dir, exist_ok=True)
     if redux:
@@ -98,6 +116,10 @@ def process_directory(input_dir, output_dir, acceleration, redux, prompt, fp8):
 
     pipe.enable_model_cpu_offload()
     pipe.set_progress_bar_config(disable=True)
+
+    # Apply LoRA before acceleration
+    if lora_file:
+        pipe = apply_loras(lora_file, pipe)
 
     if acceleration == "hyper":
         repo_name = "ByteDance/Hyper-SD"
@@ -136,19 +158,20 @@ def process_directory(input_dir, output_dir, acceleration, redux, prompt, fp8):
 
     # Create a list of files that need processing, excluding already processed files
     files_to_process = []
-    print (f"output_dir directory: {output_dir}")
+    print(f"output_dir directory: {output_dir}")
     
     for f in png_files:
         filename = os.path.basename(f)  # Extract only the filename
         output_path = os.path.join(output_dir, filename)  # Output path is based on the filename
-        print (f"Output path: {output_path}")
+        print(f"Output path: {output_path}")
         if not os.path.exists(output_path):
-            files_to_process.append(f)  # Only add files that don't exist in the output directory
+            files_to_process.append(f)  # Only add files that don’t exist in the output directory
         else:
             print(f"Skipping {f}: already exists in output directory.")  # Debugging line
 
     # Debug: print the number of files that need processing
     print(f"Total files to process: {len(files_to_process)}")
+    print(f"Scale_down flag: {scale_down}")
 
     total_files_to_process = len(files_to_process)
 
@@ -164,16 +187,32 @@ def process_directory(input_dir, output_dir, acceleration, redux, prompt, fp8):
 
             try:
                 # Process the image file
-                # init_image = Image.open(input_path).convert("RGB")
                 init_image = load_image(input_path)
-                width, height = init_image.size
+
+                # Debug scale-down process thoroughly
+                print(f"\nProcessing {fname}:")
+                # Apply scale down if requested
+                if scale_down:
+                    width, height = init_image.size
+                    pixel_count = width * height
+                    print(f"  Original size: {width}x{height} ({pixel_count} pixels)")
+                    if  pixel_count > 1_500_000:  # Between 1.5MP and 2.2MP, scale down 2x
+                        init_image = upscale_to_sdxl(input_path)
+                    else:
+                        print(f"  Image below 1.5MP, no scaling applied")
+                    width, height = init_image.size  # Update dimensions after resize
+                    print(f"  Size after resize: {width}x{height} ({width * height} pixels)")
+                    
+                width, height = init_image.size  # Ensure we use the latest dimensions
                 # Add your image processing logic here
-                current_pixels = width * height
-                
+                current_pixels = width * height                    
                 # If image is already 1MP or larger, return original
                 if current_pixels <= 1_000_000:
-                    init_image=upscale_to_sdxl(input_path)
+                    print(f"  Image below 1Mpixel, scaling up to nearest SDXL resolution")
+                    init_image = upscale_to_sdxl(input_path)
                     width, height = init_image.size       
+
+                print(f"  Final processing size: {width}x{height} ({current_pixels} pixels)")
 
                 def callback(pipe, step, timestep, callback_kwargs):
                     latents = callback_kwargs.get("latents", None)
@@ -246,7 +285,6 @@ def process_directory(input_dir, output_dir, acceleration, redux, prompt, fp8):
             except Exception as e:
                 print(f"Skipping {fname}: {e}")
 
-
 def upscale_to_sdxl(image_path):
     """
     Upscale image to nearest SDXL resolution (maintaining aspect ratio) if below 1 megapixel.
@@ -304,7 +342,6 @@ def upscale_to_sdxl(image_path):
     resized_img = img.resize(best_size, Image.LANCZOS)   
     return resized_img
 
-
 def main():
     parser = argparse.ArgumentParser(description="Process PNG files.")
     parser.add_argument('path', type=str, 
@@ -325,13 +362,16 @@ def main():
     parser.add_argument('--load-fp8', '-q', type=str,
                         help="Use a local FP8 quantized transformer model")  
 
-    # Create mutually exclusive group
-    group = parser.add_mutually_exclusive_group()
-    group.add_argument('--output_dir', '-o', type=str,
-                       help='Optional output directory. If not provided, outputs will be placed in current directory.')
+    # Add new scale-down option
+    parser.add_argument('--scale-down', '-d', action='store_true',
+                        help="Scale down the source image by 50% before processing if above 1.5 megapixels")
 
-    group.add_argument('--subdir', '-s', type=str,
-                       help='Use subdir output directory. It will save all files in the specified subdirectory of the given path.')
+    # Add LoRA option
+    parser.add_argument('--lora', '-l', type=str,
+                        help="Path to a LoRA file to apply before acceleration")
+
+    parser.add_argument('--output_dir', '-o', type=str,
+                       help='Optional output directory. If not provided, outputs will be placed in current directory.')
 
     args = parser.parse_args()
 
@@ -344,16 +384,11 @@ def main():
         args.prompt = 'Very detailed, masterpiece quality'
 
     # Determine output directory
-    if args.subdir:
-        out_dir = os.path.join(args.path, args.subdir)
-    elif args.output_dir:
-        out_dir = args.output_dir
-    else:
-        out_dir = os.getcwd() # Default to current directory
+    out_dir = args.output_dir if args.output_dir else os.getcwd()
 
-    print (f"Output directory: {out_dir}")
+    print(f"Output directory: {out_dir}")
 
-    process_directory(args.path, out_dir, args.acceleration, args.redux, args.prompt, args.load_fp8)
-
+    process_directory(args.path, out_dir, args.acceleration, args.redux, args.prompt, args.load_fp8, args.lora, args.scale_down)
+    
 if __name__ == "__main__":
     main()
