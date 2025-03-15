@@ -75,8 +75,16 @@ def prepare_repo(repo_name, revision="main"):
 
 
 def miaoshuai_tagger(image):
-    model = AutoModelForCausalLM.from_pretrained("MiaoshouAI/Florence-2-large-PromptGen-v2.0", trust_remote_code=True)
-    processor = AutoProcessor.from_pretrained("MiaoshouAI/Florence-2-large-PromptGen-v2.0", trust_remote_code=True)
+    # Use AutoModelForCausalLM instead of directly loading the model class
+    model = AutoModelForCausalLM.from_pretrained(
+        "MiaoshouAI/Florence-2-large-PromptGen-v2.0", 
+        trust_remote_code=True
+    ).to(device)
+    
+    processor = AutoProcessor.from_pretrained(
+        "MiaoshouAI/Florence-2-large-PromptGen-v2.0", 
+        trust_remote_code=True
+    )
 
     prompt = "<MORE_DETAILED_CAPTION>"
 
@@ -93,8 +101,15 @@ def miaoshuai_tagger(image):
 
     parsed_answer = processor.post_process_generation(generated_text, task=prompt, image_size=(image.width, image.height))
 
-    print(parsed_answer)
-    return parsed_answer
+    # Extract the string from the dictionary
+    if isinstance(parsed_answer, dict) and prompt in parsed_answer:
+        result = parsed_answer[prompt]
+    else:
+        result = str(parsed_answer)  # Fallback to string representation
+    
+    print(result)
+    return result  # Return the string instead of the dictionary
+
 
 def apply_loras(lorafile, pipe):
     if not lorafile:
@@ -280,10 +295,6 @@ def process_single_image(input_path, output_path, pipe, pipe_prior_redux, prompt
             desired_num_steps = 10
         else:
             desired_num_steps = 25
-            
-        if mode == "depth":
-            processor = DepthPreprocessor.from_pretrained("LiheYoung/depth-anything-large-hf")
-            control_image = processor(init_image)[0].convert("RGB")
 
         # Calculate inference steps based on strength
         num_inference_steps = desired_num_steps / effective_strength
@@ -302,8 +313,12 @@ def process_single_image(input_path, output_path, pipe, pipe_prior_redux, prompt
             if mode=="redux":
                 pipe_prior_output = pipe_prior_redux(image=init_image)
                 num_images = 1
+            elif mode=="refiner":
+                num_images = 1
             else:
                 num_images = 1
+                processor = DepthPreprocessor.from_pretrained("LiheYoung/depth-anything-large-hf").to(device)
+                control_image = processor(init_image)[0].convert("RGB")                
                 
             with tqdm(total=desired_num_steps, desc=f"Steps for {fname}", leave=True) as step_pbar:
                 callback.step_pbar = step_pbar
