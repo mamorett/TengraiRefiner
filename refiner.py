@@ -18,6 +18,9 @@ warnings.filterwarnings('ignore')
 import argparse
 from diffusers.utils import load_image
 from image_gen_aux import DepthPreprocessor
+import time
+import torch.profiler
+from safetensors.torch import load_file
 
 load_dotenv()
 
@@ -93,7 +96,7 @@ def miaoshuai_tagger(image):
     generated_ids = model.generate(
         input_ids=inputs["input_ids"],
         pixel_values=inputs["pixel_values"],
-        max_new_tokens=1024,
+        max_new_tokens=77,
         do_sample=False,
         num_beams=3
     )
@@ -128,6 +131,7 @@ def apply_loras(lorafile, pipe):
                 print(f"Failed to apply LoRA {lora_name}: {str(e)}")
                 # Continue with next LoRA even if one fails
     return pipe
+
 
 def setup_pipeline(mode, acceleration, lora_file, fp8):
     """Set up and configure the appropriate pipeline based on parameters."""
@@ -175,11 +179,14 @@ def setup_pipeline(mode, acceleration, lora_file, fp8):
             transformer=transformer,
         )        
 
+    # Enable memory optimizations before applying LoRA
     pipe.enable_model_cpu_offload()
     pipe.enable_vae_slicing()
     pipe.enable_attention_slicing(4)
-
     pipe.set_progress_bar_config(disable=True)
+    
+    # Clear cache again before LoRA application
+    torch.cuda.empty_cache()
     
     # Apply LoRA before acceleration
     if lora_file:
@@ -191,10 +198,12 @@ def setup_pipeline(mode, acceleration, lora_file, fp8):
         ckpt_name = "Hyper-FLUX.1-dev-8steps-lora.safetensors"
         pipe.load_lora_weights(hf_hub_download(repo_name, ckpt_name))
         pipe.fuse_lora(lora_scale=0.125)
+        print(f"Loaded Hyper-SD adapter: {ckpt_name}")
     elif acceleration == "alimama":
         adapter_id = "alimama-creative/FLUX.1-Turbo-Alpha"
         pipe.load_lora_weights(adapter_id)
         pipe.fuse_lora(lora_scale=1)
+        print(f"Loaded adapter: {adapter_id}")
 
     # Handle transformer quantization or loading
     if not fp8:
@@ -212,6 +221,7 @@ def setup_pipeline(mode, acceleration, lora_file, fp8):
             print("Falling back to default transformer")
                 
     return pipe, pipe_prior_redux
+
 
 def prepare_image(input_path, scale_down=False):
     """
@@ -256,6 +266,19 @@ def prepare_image(input_path, scale_down=False):
     print(f"  Final processing size: {width}x{height} ({current_pixels} pixels)")
     
     return init_image, width, height
+
+def warmup_pipeline(pipe, pipe_prior_redux, mode):
+    dummy_image = Image.new("RGB", (128, 128), (255, 255, 255))
+    if mode == "redux":
+        pipe_prior_redux(image=dummy_image)
+        pipe(**pipe_prior_redux(image=dummy_image), num_inference_steps=1)
+    elif mode == "refiner":
+        pipe(prompt="test", image=dummy_image, num_inference_steps=1)
+    else:  # depth
+        processor = DepthPreprocessor.from_pretrained("LiheYoung/depth-anything-large-hf").to(device)
+        control_image = processor(dummy_image)[0].convert("RGB")
+        pipe(prompt="test", control_image=control_image, num_inference_steps=1)
+
 
 def process_single_image(input_path, output_path, pipe, pipe_prior_redux, prompt, mode, acceleration, strength, scale_down):
     """
@@ -393,15 +416,17 @@ def get_files_to_process(input_dir, output_dir):
         png_files = [filename]  # Store only the filename
         input_dir = input_dir_path  # Update input_dir to be the directory
     elif os.path.isdir(input_dir):
-        # If input_dir is a directory, get all PNG files
-        png_files = sorted([f for f in os.listdir(input_dir) if f.lower().endswith('.png')])
+        # If input_dir is a directory, get all image files with supported extensions
+        valid_extensions = ('.png', '.jpg', '.jpeg', '.webp')
+        png_files = sorted([f for f in os.listdir(input_dir) 
+                        if f.lower().endswith(valid_extensions)])
     else:
         raise ValueError("Input must be either a file or a directory.")
 
     # Create a list of files that need processing, excluding already processed files
     files_to_process = []
     print(f"Output directory: {output_dir}")
-    
+
     for f in png_files:
         filename = os.path.basename(f)  # Extract only the filename
         output_path = os.path.join(output_dir, filename)  # Output path is based on the filename
@@ -413,8 +438,9 @@ def get_files_to_process(input_dir, output_dir):
 
     # Debug: print the number of files that need processing
     print(f"Total files to process: {len(files_to_process)}")
-    
+
     return input_dir, files_to_process
+
 
 def process_directory(input_dir, output_dir, acceleration, prompt, fp8, lora_file, scale_down=False, strength=0.20,  mode="refiner"):
     """
@@ -436,6 +462,10 @@ def process_directory(input_dir, output_dir, acceleration, prompt, fp8, lora_fil
     
     # Setup the pipeline
     pipe, pipe_prior_redux = setup_pipeline(mode, acceleration, lora_file, fp8)
+
+    # In process_directory, before the loop:
+    print("Warming up pipeline...")
+    warmup_pipeline(pipe, pipe_prior_redux, mode)
     
     # Get files to process
     input_dir, files_to_process = get_files_to_process(input_dir, output_dir)
@@ -457,8 +487,8 @@ def process_directory(input_dir, output_dir, acceleration, prompt, fp8, lora_fil
                 strength,
                 scale_down
             )
-            
-            main_pbar.update(1)
+            if success:
+                main_pbar.update(1)
 
 
 def upscale_to_sdxl(image_path):
