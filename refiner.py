@@ -35,6 +35,10 @@ repo_depth = "black-forest-labs/FLUX.1-Depth-dev"
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
+# Memory optimization techniques
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+
 
 class LyingSigmaSampler:
     def __init__(self, 
@@ -66,14 +70,27 @@ class LyingSigmaSampler:
 
         return model_wrapper(x, sigmas, **kwargs)
 
-def prepare_repo(repo_name, revision="main"):
-    scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(bfl_repo, subfolder="scheduler", revision=revision)
-    text_encoder = CLIPTextModel.from_pretrained("openai/clip-vit-large-patch14", torch_dtype=dtype)
-    tokenizer = CLIPTokenizer.from_pretrained("openai/clip-vit-large-patch14", torch_dtype=dtype)
-    text_encoder_2 = T5EncoderModel.from_pretrained(bfl_repo, subfolder="text_encoder_2", torch_dtype=dtype, revision=revision)
-    tokenizer_2 = T5TokenizerFast.from_pretrained(bfl_repo, subfolder="tokenizer_2", torch_dtype=dtype, revision=revision)
-    vae = AutoencoderKL.from_pretrained(bfl_repo, subfolder="vae", torch_dtype=dtype, revision=revision)
+
+def cleanup():
+    torch.cuda.empty_cache()
+    torch.cuda.ipc_collect()
+
+
+def prepare_repo(repo_name, revision="main", safetensor_path=None):
+    with torch.device("cpu"):
+        text_encoder = CLIPTextModel.from_pretrained("openai/clip-vit-large-patch14", torch_dtype=dtype)
+        text_encoder_2 = T5EncoderModel.from_pretrained(bfl_repo, subfolder="text_encoder_2", torch_dtype=dtype, revision=revision)
+        tokenizer = CLIPTokenizer.from_pretrained("openai/clip-vit-large-patch14", torch_dtype=dtype)
+        tokenizer_2 = T5TokenizerFast.from_pretrained(bfl_repo, subfolder="tokenizer_2", torch_dtype=dtype, revision=revision)
     transformer = FluxTransformer2DModel.from_pretrained(repo_name, subfolder="transformer", torch_dtype=dtype, revision=revision)
+    if safetensor_path:
+        print("Loading transformer...")
+        state_dict = load_file(safetensor_path, device=device)
+        transformer.load_state_dict(state_dict, strict=False)
+        transformer.eval()
+    vae = AutoencoderKL.from_pretrained(bfl_repo, subfolder="vae", torch_dtype=dtype, revision=revision).to(device)
+    scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(bfl_repo, subfolder="scheduler", revision=revision)
+
     return scheduler, text_encoder, tokenizer, text_encoder_2, tokenizer_2, vae, transformer
 
 
@@ -130,6 +147,7 @@ def apply_loras(lorafile, pipe):
             except Exception as e:
                 print(f"Failed to apply LoRA {lora_name}: {str(e)}")
                 # Continue with next LoRA even if one fails
+    cleanup()                
     return pipe
 
 
@@ -144,24 +162,10 @@ def setup_pipeline(mode, acceleration, lora_file, safetensor_path=None):
     print(f"Total reserved VRAM: {torch.cuda.memory_reserved(device) / 1024**3:.2f} GB")
 
     if mode == "depth":
-        scheduler, text_encoder, tokenizer, text_encoder_2, tokenizer_2, vae, transformer = prepare_repo(repo_depth, revision="main")
+        scheduler, text_encoder, tokenizer, text_encoder_2, tokenizer_2, vae, transformer = prepare_repo(repo_depth, revision="main", safetensor_path=safetensor_path)
     else:
-        scheduler, text_encoder, tokenizer, text_encoder_2, tokenizer_2, vae, transformer = prepare_repo(bfl_repo, revision="main")
+        scheduler, text_encoder, tokenizer, text_encoder_2, tokenizer_2, vae, transformer = prepare_repo(bfl_repo, revision="main", safetensor_path=safetensor_path)
     
-    # Load safetensor if provided
-    if safetensor_path:
-        print(f"Loading transformer from safetensor: {safetensor_path}")
-        try:
-            # Load to CPU and keep it there initially
-            state_dict = load_file(safetensor_path, device="cpu")
-            transformer.load_state_dict(state_dict, strict=False)
-            transformer.eval()
-            print("Successfully loaded safetensor weights to CPU")
-        except Exception as e:
-            print(f"Error loading safetensor: {e}")
-            print("Falling back to default transformer")
-            torch.cuda.empty_cache()
-
     # Pipeline creation
     if mode == "redux":
         pipe_prior_redux = FluxPriorReduxPipeline.from_pretrained(
@@ -200,31 +204,6 @@ def setup_pipeline(mode, acceleration, lora_file, safetensor_path=None):
             transformer=transformer,
         )
 
-    # Apply offloading based on safetensor usage
-    print("Using model CPU offload for quantized mode")
-    try:
-        pipe.enable_model_cpu_offload()
-    except RuntimeError as e:
-        if "out of memory" in str(e).lower():
-            print(f"CUDA OOM during model offload: {e}")
-            print("Falling back to sequential CPU offload")
-            pipe.enable_sequential_cpu_offload()
-        else:
-            raise e
-
-    # Additional optimizations
-    try:
-        pipe.enable_vae_slicing()
-    except AttributeError:
-        print("VAE slicing not supported, skipping...")
-    try:
-        pipe.enable_attention_slicing(4)
-    except AttributeError:
-        print("Attention slicing not supported, skipping...")
-    pipe.set_progress_bar_config(disable=True)
-    
-    # Clear cache before LoRA
-    torch.cuda.empty_cache()
     print(f"VRAM after pipeline setup: {torch.cuda.memory_allocated(device) / 1024**3:.2f} GB")
     
     # Apply LoRA
@@ -257,6 +236,29 @@ def setup_pipeline(mode, acceleration, lora_file, safetensor_path=None):
             print(f"Loaded adapter: {adapter_id}")
         except RuntimeError as e:
             print(f"Failed to load Alimama: {e}")
+
+    if safetensor_path:
+        print("Falling back to sequential CPU offload")
+        pipe.enable_sequential_cpu_offload()
+    else:
+        # Apply offloading based on safetensor usage
+        print("Using model CPU offload for quantized mode")
+        pipe.enable_model_cpu_offload()
+
+    # Additional optimizations
+    try:
+        pipe.enable_vae_tiling()
+    except AttributeError:
+        print("VAE tiling not supported, skipping...")    
+    try:
+        pipe.enable_vae_slicing()
+    except AttributeError:
+        print("VAE slicing not supported, skipping...")
+    try:
+        pipe.enable_attention_slicing(4)
+    except AttributeError:
+        print("Attention slicing not supported, skipping...")
+    pipe.set_progress_bar_config(disable=True)
 
     # Quantize if no safetensor
     if not safetensor_path:
@@ -624,7 +626,8 @@ def main():
                         help="Path to a LoRA file to apply before acceleration")
 
     parser.add_argument('--denoise', '-d', type=float,
-                        help="Denoise strength for refine processing")                        
+                        default=0.20,  # Add default value
+                        help="Denoise strength for refine processing (0.0-1.0)")                        
 
     parser.add_argument('--output_dir', '-o', type=str,
                        help='Optional output directory. If not provided, outputs will be placed in current directory.')
