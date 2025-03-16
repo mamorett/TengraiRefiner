@@ -35,6 +35,10 @@ repo_depth = "black-forest-labs/FLUX.1-Depth-dev"
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
+# Memory optimization techniques
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+
 
 class LyingSigmaSampler:
     def __init__(self, 
@@ -66,14 +70,27 @@ class LyingSigmaSampler:
 
         return model_wrapper(x, sigmas, **kwargs)
 
-def prepare_repo(repo_name, revision="main"):
-    scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(bfl_repo, subfolder="scheduler", revision=revision)
-    text_encoder = CLIPTextModel.from_pretrained("openai/clip-vit-large-patch14", torch_dtype=dtype)
-    tokenizer = CLIPTokenizer.from_pretrained("openai/clip-vit-large-patch14", torch_dtype=dtype)
-    text_encoder_2 = T5EncoderModel.from_pretrained(bfl_repo, subfolder="text_encoder_2", torch_dtype=dtype, revision=revision)
-    tokenizer_2 = T5TokenizerFast.from_pretrained(bfl_repo, subfolder="tokenizer_2", torch_dtype=dtype, revision=revision)
-    vae = AutoencoderKL.from_pretrained(bfl_repo, subfolder="vae", torch_dtype=dtype, revision=revision)
+
+def cleanup():
+    torch.cuda.empty_cache()
+    torch.cuda.ipc_collect()
+
+
+def prepare_repo(repo_name, revision="main", safetensor_path=None):
+    with torch.device("cpu"):
+        text_encoder = CLIPTextModel.from_pretrained("openai/clip-vit-large-patch14", torch_dtype=dtype)
+        text_encoder_2 = T5EncoderModel.from_pretrained(bfl_repo, subfolder="text_encoder_2", torch_dtype=dtype, revision=revision)
+        tokenizer = CLIPTokenizer.from_pretrained("openai/clip-vit-large-patch14", torch_dtype=dtype)
+        tokenizer_2 = T5TokenizerFast.from_pretrained(bfl_repo, subfolder="tokenizer_2", torch_dtype=dtype, revision=revision)
     transformer = FluxTransformer2DModel.from_pretrained(repo_name, subfolder="transformer", torch_dtype=dtype, revision=revision)
+    if safetensor_path:
+        print("Loading transformer...")
+        state_dict = load_file(safetensor_path, device=device)
+        transformer.load_state_dict(state_dict, strict=False)
+        transformer.eval()
+    vae = AutoencoderKL.from_pretrained(bfl_repo, subfolder="vae", torch_dtype=dtype, revision=revision).to(device)
+    scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(bfl_repo, subfolder="scheduler", revision=revision)
+
     return scheduler, text_encoder, tokenizer, text_encoder_2, tokenizer_2, vae, transformer
 
 
@@ -130,23 +147,31 @@ def apply_loras(lorafile, pipe):
             except Exception as e:
                 print(f"Failed to apply LoRA {lora_name}: {str(e)}")
                 # Continue with next LoRA even if one fails
+    cleanup()                
     return pipe
 
 
-def setup_pipeline(mode, acceleration, lora_file, fp8):
+def setup_pipeline(mode, acceleration, lora_file, safetensor_path=None):
     """Set up and configure the appropriate pipeline based on parameters."""
     pipe_prior_redux = None
 
+    # Aggressive memory cleanup
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats(device)
+    print(f"Initial VRAM usage (PyTorch): {torch.cuda.memory_allocated(device) / 1024**3:.2f} GB")
+    print(f"Total reserved VRAM: {torch.cuda.memory_reserved(device) / 1024**3:.2f} GB")
+
     if mode == "depth":
-        scheduler, text_encoder, tokenizer, text_encoder_2, tokenizer_2, vae, transformer = prepare_repo(repo_depth, revision="main")
+        scheduler, text_encoder, tokenizer, text_encoder_2, tokenizer_2, vae, transformer = prepare_repo(repo_depth, revision="main", safetensor_path=safetensor_path)
     else:
-        scheduler, text_encoder, tokenizer, text_encoder_2, tokenizer_2, vae, transformer = prepare_repo(bfl_repo, revision="main")
+        scheduler, text_encoder, tokenizer, text_encoder_2, tokenizer_2, vae, transformer = prepare_repo(bfl_repo, revision="main", safetensor_path=safetensor_path)
     
-    if mode=="redux":
+    # Pipeline creation
+    if mode == "redux":
         pipe_prior_redux = FluxPriorReduxPipeline.from_pretrained(
             repo_redux, 
             torch_dtype=dtype
-        )    
+        )
         pipe_prior_redux.enable_model_cpu_offload()
 
         pipe = FluxPipeline(
@@ -158,7 +183,7 @@ def setup_pipeline(mode, acceleration, lora_file, fp8):
             vae=vae,
             transformer=transformer,
         )
-    elif mode=="refiner":
+    elif mode == "refiner":
         pipe = FluxImg2ImgPipeline(
             scheduler=scheduler,
             text_encoder=text_encoder,
@@ -177,48 +202,75 @@ def setup_pipeline(mode, acceleration, lora_file, fp8):
             tokenizer_2=tokenizer_2,
             vae=vae,
             transformer=transformer,
-        )        
+        )
 
-    # Enable memory optimizations before applying LoRA
-    pipe.enable_model_cpu_offload()
-    pipe.enable_vae_slicing()
-    pipe.enable_attention_slicing(4)
-    pipe.set_progress_bar_config(disable=True)
+    print(f"VRAM after pipeline setup: {torch.cuda.memory_allocated(device) / 1024**3:.2f} GB")
     
-    # Clear cache again before LoRA application
-    torch.cuda.empty_cache()
-    
-    # Apply LoRA before acceleration
+    # Apply LoRA
     if lora_file:
-        pipe = apply_loras(lora_file, pipe)
+        try:
+            pipe = apply_loras(lora_file, pipe)
+            print(f"VRAM after LoRA: {torch.cuda.memory_allocated(device) / 1024**3:.2f} GB")
+        except RuntimeError as e:
+            if "out of memory" in str(e).lower():
+                print(f"CUDA OOM during LoRA: {e}")
+                print("Skipping LoRA application")
+            else:
+                raise e
 
-    # Apply acceleration if specified
+    # Apply acceleration
     if acceleration == "hyper":
         repo_name = "ByteDance/Hyper-SD"
         ckpt_name = "Hyper-FLUX.1-dev-8steps-lora.safetensors"
-        pipe.load_lora_weights(hf_hub_download(repo_name, ckpt_name))
-        pipe.fuse_lora(lora_scale=0.125)
-        print(f"Loaded Hyper-SD adapter: {ckpt_name}")
+        try:
+            pipe.load_lora_weights(hf_hub_download(repo_name, ckpt_name))
+            pipe.fuse_lora(lora_scale=0.125)
+            print(f"Loaded Hyper-SD adapter: {ckpt_name}")
+        except RuntimeError as e:
+            print(f"Failed to load Hyper-SD: {e}")
     elif acceleration == "alimama":
         adapter_id = "alimama-creative/FLUX.1-Turbo-Alpha"
-        pipe.load_lora_weights(adapter_id)
-        pipe.fuse_lora(lora_scale=1)
-        print(f"Loaded adapter: {adapter_id}")
+        try:
+            pipe.load_lora_weights(adapter_id)
+            pipe.fuse_lora(lora_scale=1)
+            print(f"Loaded adapter: {adapter_id}")
+        except RuntimeError as e:
+            print(f"Failed to load Alimama: {e}")
 
-    # Handle transformer quantization or loading
-    if not fp8:
+    if safetensor_path:
+        print("Falling back to sequential CPU offload")
+        pipe.enable_sequential_cpu_offload()
+    else:
+        # Apply offloading based on safetensor usage
+        print("Using model CPU offload for quantized mode")
+        pipe.enable_model_cpu_offload()
+
+    # Additional optimizations
+    try:
+        pipe.enable_vae_tiling()
+    except AttributeError:
+        print("VAE tiling not supported, skipping...")    
+    try:
+        pipe.enable_vae_slicing()
+    except AttributeError:
+        print("VAE slicing not supported, skipping...")
+    try:
+        pipe.enable_attention_slicing(4)
+    except AttributeError:
+        print("Attention slicing not supported, skipping...")
+    pipe.set_progress_bar_config(disable=True)
+
+    # Quantize if no safetensor
+    if not safetensor_path:
         print(datetime.datetime.now(), "Quantizing transformer")
         quantize(transformer, weights=qfloat8)
         freeze(transformer)
-    else:
-        try:
-            print(f"Loading FP8 transformer: {fp8}")
-            fp8_transformer = torch.load(fp8, weights_only=False, map_location=device)
-            fp8_transformer.eval()
-            pipe.transformer = fp8_transformer
-        except Exception as e:
-            print(f"Error loading FP8 transformer: {e}")
-            print("Falling back to default transformer")
+        print(f"VRAM after quantization: {torch.cuda.memory_allocated(device) / 1024**3:.2f} GB")
+
+    # Final memory state
+    print(f"Final VRAM usage: {torch.cuda.memory_allocated(device) / 1024**3:.2f} GB")
+    print(f"Peak VRAM usage: {torch.cuda.max_memory_allocated(device) / 1024**3:.2f} GB")
+    torch.cuda.empty_cache()
                 
     return pipe, pipe_prior_redux
 
@@ -442,7 +494,7 @@ def get_files_to_process(input_dir, output_dir):
     return input_dir, files_to_process
 
 
-def process_directory(input_dir, output_dir, acceleration, prompt, fp8, lora_file, scale_down=False, strength=0.20,  mode="refiner"):
+def process_directory(input_dir, output_dir, acceleration, prompt, safetensor_path=None, lora_file=None, scale_down=False, strength=0.20, mode="refiner"):
     """
     Process all images in a directory with the specified parameters.
     Args:
@@ -460,17 +512,14 @@ def process_directory(input_dir, output_dir, acceleration, prompt, fp8, lora_fil
     """
     os.makedirs(output_dir, exist_ok=True)
     
-    # Setup the pipeline
-    pipe, pipe_prior_redux = setup_pipeline(mode, acceleration, lora_file, fp8)
-
-    # In process_directory, before the loop:
+    # Setup the pipeline with safetensor_path
+    pipe, pipe_prior_redux = setup_pipeline(mode, acceleration, lora_file, safetensor_path)
+    
     print("Warming up pipeline...")
     warmup_pipeline(pipe, pipe_prior_redux, mode)
     
-    # Get files to process
     input_dir, files_to_process = get_files_to_process(input_dir, output_dir)
     
-    # Process each file
     with tqdm(total=len(files_to_process), desc="Processing images", unit="img") as main_pbar:
         for filename in files_to_process:
             input_path = os.path.join(input_dir, filename)
@@ -567,27 +616,24 @@ def main():
                     default='refiner',
                     help='Set mode of operation (refiner|redux|depth), if not defined defaults to refiner')     
 
-    parser.add_argument('--load-fp8', '-q', type=str,
-                        help="Use a local FP8 quantized transformer model")  
+    parser.add_argument('--safetensor', '-t', type=str,
+                        help="Path to a Flux safetensor file to load transformer weights")
 
-    # Add new scale-down option
     parser.add_argument('--scale-down', '-s', action='store_true',
                         help="Scale down the source image by 50% before processing if above 1.5 megapixels")
 
-    # Add LoRA option
     parser.add_argument('--lora', '-l', type=str,
                         help="Path to a LoRA file to apply before acceleration")
 
-    # Add denoise option
     parser.add_argument('--denoise', '-d', type=float,
-                        help="Denoise strength for refine processing")                        
+                        default=0.20,  # Add default value
+                        help="Denoise strength for refine processing (0.0-1.0)")                        
 
     parser.add_argument('--output_dir', '-o', type=str,
                        help='Optional output directory. If not provided, outputs will be placed in current directory.')
 
     args = parser.parse_args()
 
-    # Ensure `path` is either a file or directory
     if not os.path.exists(args.path):
         print(f"Error: {args.path} does not exist.")
         exit(1)
@@ -595,12 +641,11 @@ def main():
     if not args.prompt:
         args.prompt = 'Very detailed, masterpiece quality'
 
-    # Determine output directory
     out_dir = args.output_dir if args.output_dir else os.getcwd()
 
     print(f"Output directory: {out_dir}")
 
-    process_directory(args.path, out_dir, args.acceleration, args.prompt, args.load_fp8, args.lora, args.scale_down, args.denoise, args.mode)
-    
+    process_directory(args.path, out_dir, args.acceleration, args.prompt, args.safetensor, args.lora, args.scale_down, args.denoise, args.mode)
+
 if __name__ == "__main__":
     main()
