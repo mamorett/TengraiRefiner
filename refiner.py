@@ -193,6 +193,16 @@ def setup_pipeline(mode, acceleration, lora_file, safetensor_path=None):
             vae=vae,
             transformer=transformer,
         )
+    elif mode == "rejoy":
+        pipe = FluxPipeline(
+            scheduler=scheduler,
+            text_encoder=text_encoder,
+            tokenizer=tokenizer,
+            text_encoder_2=text_encoder_2,
+            tokenizer_2=tokenizer_2,
+            vae=vae,
+            transformer=transformer,
+        )
     else:
         pipe = FluxControlPipeline(
             scheduler=scheduler,
@@ -326,13 +336,15 @@ def warmup_pipeline(pipe, pipe_prior_redux, mode):
         pipe(**pipe_prior_redux(image=dummy_image), num_inference_steps=1)
     elif mode == "refiner":
         pipe(prompt="test", image=dummy_image, num_inference_steps=1)
+    elif mode == "rejoy":
+        pipe(prompt="test", num_inference_steps=1)        
     else:  # depth
         processor = DepthPreprocessor.from_pretrained("LiheYoung/depth-anything-large-hf").to(device)
         control_image = processor(dummy_image)[0].convert("RGB")
         pipe(prompt="test", control_image=control_image, num_inference_steps=1)
 
 
-def process_single_image(input_path, output_path, pipe, pipe_prior_redux, prompt, mode, acceleration, strength, scale_down):
+def process_single_image(input_path, output_path, pipe, pipe_prior_redux, prompt, mode, acceleration, strength, scale_down, cfg, steps):
     """
     Process a single image with the configured pipeline.
     Args:
@@ -369,7 +381,7 @@ def process_single_image(input_path, output_path, pipe, pipe_prior_redux, prompt
         if acceleration in ["alimama", "hyper"]:
             desired_num_steps = 10
         else:
-            desired_num_steps = 25
+            desired_num_steps = steps
 
         # Calculate inference steps based on strength
         num_inference_steps = desired_num_steps / effective_strength
@@ -390,6 +402,8 @@ def process_single_image(input_path, output_path, pipe, pipe_prior_redux, prompt
                 num_images = 1
             elif mode=="refiner":
                 num_images = 1
+            elif mode=="rejoy":
+                num_images = 1                
             else:
                 num_images = 1
                 processor = DepthPreprocessor.from_pretrained("LiheYoung/depth-anything-large-hf").to(device)
@@ -399,7 +413,7 @@ def process_single_image(input_path, output_path, pipe, pipe_prior_redux, prompt
                 callback.step_pbar = step_pbar
                 if mode == "redux":
                     result = pipe(
-                        guidance_scale=2.5,
+                        guidance_scale=cfg,
                         num_inference_steps=int(num_inference_steps),
                         height=height,
                         width=width,                                
@@ -412,12 +426,22 @@ def process_single_image(input_path, output_path, pipe, pipe_prior_redux, prompt
                         image=init_image,
                         num_inference_steps=int(num_inference_steps),
                         strength=effective_strength,
-                        guidance_scale=3.0,
+                        guidance_scale=cfg,
                         height=height,
                         width=width,
                         num_images_per_prompt=num_images,
                         callback_on_step_end=callback
                     ).images
+                elif mode == "rejoy":
+                    result = pipe(
+                        prompt=prompt,
+                        num_inference_steps=int(num_inference_steps),
+                        guidance_scale=cfg,
+                        height=height,
+                        width=width,
+                        num_images_per_prompt=num_images,
+                        callback_on_step_end=callback
+                    ).images                
                 else:
                     result = pipe(
                         prompt=prompt,
@@ -494,7 +518,7 @@ def get_files_to_process(input_dir, output_dir):
     return input_dir, files_to_process
 
 
-def process_directory(input_dir, output_dir, acceleration, prompt, safetensor_path=None, lora_file=None, scale_down=False, strength=0.20, mode="refiner"):
+def process_directory(input_dir, output_dir, acceleration, prompt, safetensor_path=None, lora_file=None, scale_down=False, strength=0.20, mode="refiner", cfg=3.0, steps=25):
     """
     Process all images in a directory with the specified parameters.
     Args:
@@ -534,7 +558,9 @@ def process_directory(input_dir, output_dir, acceleration, prompt, safetensor_pa
                 mode, 
                 acceleration, 
                 strength,
-                scale_down
+                scale_down,
+                cfg,
+                steps
             )
             if success:
                 main_pbar.update(1)
@@ -612,7 +638,7 @@ def main():
                     help='Set a custom prompts, if not defined defaults to Very detailed, masterpiece quality')
 
     parser.add_argument('--mode', '-m', type=str,
-                    choices=['refiner', 'redux', 'depth'],
+                    choices=['refiner', 'redux', 'depth', 'rejoy'],
                     default='refiner',
                     help='Set mode of operation (refiner|redux|depth), if not defined defaults to refiner')     
 
@@ -627,7 +653,15 @@ def main():
 
     parser.add_argument('--denoise', '-d', type=float,
                         default=0.20,  # Add default value
-                        help="Denoise strength for refine processing (0.0-1.0)")                        
+                        help="Denoise strength for refine processing (0.0-1.0)")
+    
+    parser.add_argument('--cfg', '-c', type=float,
+                        default=3.0,  # Add default value
+                        help="Cfg strength for refine processing")
+
+    parser.add_argument('--steps', '-e', type=int,
+                        default=25,  # Add default value
+                        help="Number of steps for processing")         
 
     parser.add_argument('--output_dir', '-o', type=str,
                        help='Optional output directory. If not provided, outputs will be placed in current directory.')
@@ -644,8 +678,9 @@ def main():
     out_dir = args.output_dir if args.output_dir else os.getcwd()
 
     print(f"Output directory: {out_dir}")
+    print(f"Mode of Operation: {args.mode}")
 
-    process_directory(args.path, out_dir, args.acceleration, args.prompt, args.safetensor, args.lora, args.scale_down, args.denoise, args.mode)
+    process_directory(args.path, out_dir, args.acceleration, args.prompt, args.safetensor, args.lora, args.scale_down, args.denoise, args.mode, args.cfg, args.steps)
 
 if __name__ == "__main__":
     main()
