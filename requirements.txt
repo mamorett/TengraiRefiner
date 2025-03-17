@@ -11,3 +11,4 @@ optimum-quanto
 multiformats
 xformers>=0.0.25  # Ensures compatibility with PyTorch 2.6.0+cu124
 git+https://github.com/asomoza/image_gen_aux.git
+Faker
