@@ -1,7 +1,5 @@
 import torchvision
-from torchvision import transforms
 torchvision.disable_beta_transforms_warning()
-from dotenv import load_dotenv
 import os
 import torch
 from PIL import Image
@@ -365,14 +363,15 @@ def prepare_image(input_path, scale_down=False):
                                      pixel count. Defaults to False.
     Returns:
         tuple: A tuple containing the processed image, its width, and its height.
-    Notes:
-        - If `scale_down` is True and the image has more than 1.5 million pixels, it will be scaled 
-          down using the `upscale_to_sdxl` function.
-        - If the image has fewer than 1 million pixels, it will be scaled up to the nearest SDXL 
-          resolution using the `upscale_to_sdxl` function.
     """
+    # Load the image
     init_image = load_image(input_path)
     fname = os.path.basename(input_path)
+    
+    # Convert RGBA to RGB if necessary
+    if init_image.mode == 'RGBA':
+        print(f"  Converting {fname} from RGBA to RGB")
+        init_image = init_image.convert('RGB')
     
     # Debug scale-down process thoroughly
     print(f"\nProcessing {fname}:")
@@ -382,21 +381,23 @@ def prepare_image(input_path, scale_down=False):
         pixel_count = width * height
         print(f"  Original size: {width}x{height} ({pixel_count} pixels)")
         if pixel_count > 1_500_000:  # Between 1.5MP and 2.2MP, scale down 2x
-            init_image = upscale_to_sdxl(input_path)
+            init_image = upscale_to_sdxl(init_image)  # Pass the image object
         else:
             print(f"  Image below 1.5MP, no scaling applied")
         width, height = init_image.size  # Update dimensions after resize
         print(f"  Size after resize: {width}x{height} ({width * height} pixels)")
+        print(f"  Image mode after scale-down: {init_image.mode}")
         
     width, height = init_image.size  # Ensure we use the latest dimensions
     current_pixels = width * height                    
-    # If image is already 1MP or larger, return original
+    # If image is below 1MP, scale up to nearest SDXL resolution
     if current_pixels <= 1_000_000:
         print(f"  Image below 1Mpixel, scaling up to nearest SDXL resolution")
-        init_image = upscale_to_sdxl(input_path)
-        width, height = init_image.size       
+        init_image = upscale_to_sdxl(init_image)  # Pass the image object
+        width, height = init_image.size
+        print(f"  Image mode after scale-up: {init_image.mode}")
 
-    print(f"  Final processing size: {width}x{height} ({current_pixels} pixels)")
+    print(f"  Final processing size: {width}x{height} ({width * height} pixels)")
     
     return init_image, width, height
 
@@ -592,7 +593,7 @@ def get_files_to_process(input_dir, output_dir, random_names=False):
     return input_dir, files_to_process
 
 
-def process_directory(input_dir, output_dir, acceleration, prompt, safetensor_path=None, lora_file=None, scale_down=False, strength=0.20, mode="refiner", cfg=3.0, steps=25, random_names=False):
+def process_directory(input_dir, output_dir, acceleration, prompt, safetensor_path=None, lora_file=None, scale_down=False, strength=0.35, mode="refiner", cfg=3.0, steps=25, random_names=False):
     """
     Processes all images in the input directory using the specified pipeline and saves the results to the output directory.
     Args:
@@ -603,7 +604,7 @@ def process_directory(input_dir, output_dir, acceleration, prompt, safetensor_pa
         safetensor_path (str, optional): Path to the safetensor file. Defaults to None.
         lora_file (str, optional): Path to the LoRA file. Defaults to None.
         scale_down (bool, optional): Flag to enable scaling down of images. Defaults to False.
-        strength (float, optional): Strength of the processing effect. Defaults to 0.20.
+        strength (float, optional): Strength of the processing effect. Defaults to 0.35.
         mode (str, optional): Mode of the pipeline. Defaults to "refiner".
         cfg (float, optional): Configuration parameter for the pipeline. Defaults to 3.0.
         steps (int, optional): Number of steps for the processing. Defaults to 25.
@@ -642,22 +643,19 @@ def process_directory(input_dir, output_dir, acceleration, prompt, safetensor_pa
                 main_pbar.update(1)
 
 
-def upscale_to_sdxl(image_path):
+def upscale_to_sdxl(image):
     """
     Upscale image to nearest SDXL resolution (maintaining aspect ratio) if below 1 megapixel.
     Common SDXL resolutions: 1024x1024, 1024x576, 576x1024, 1152x896, 896x1152, etc.
     
     Args:
-        image_path (str): Path to input image
+        image (PIL.Image): Input image object
     
     Returns:
         PIL.Image: Resized image object
-    """
-    # Open the image
-    img = Image.open(image_path)
-    
+    """   
     # Get current dimensions
-    width, height = img.size
+    width, height = image.size
     
     # Calculate aspect ratio
     aspect_ratio = width / height
@@ -696,8 +694,8 @@ def upscale_to_sdxl(image_path):
             best_size = (w, h)
     
     # Resize image using LANCZOS resampling (high quality)
-    resized_img = img.resize(best_size, Image.LANCZOS)   
-    return resized_img
+    resized_image = image.resize(best_size, Image.LANCZOS)   
+    return resized_image
 
 def main():
     parser = argparse.ArgumentParser(description="Process PNG files.")
@@ -728,8 +726,8 @@ def main():
                         help="Path to a LoRA file to apply before acceleration")
 
     parser.add_argument('--denoise', '-d', type=float,
-                        default=0.20,  # Add default value
-                        help="Denoise strength for refine processing (0.0-1.0)")
+                        default=0.35,  # Add default value
+                        help="Denoise strength for refine processing (0.0-1.0). Defaults to 0.35 for refiner mode.")
     
     parser.add_argument('--cfg', '-c', type=float,
                         default=3.0,  # Add default value
