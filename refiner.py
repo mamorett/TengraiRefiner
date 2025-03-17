@@ -18,9 +18,10 @@ warnings.filterwarnings('ignore')
 import argparse
 from diffusers.utils import load_image
 from image_gen_aux import DepthPreprocessor
-import time
 import torch.profiler
 from safetensors.torch import load_file
+from faker import Faker
+
 
 load_dotenv()
 
@@ -77,6 +78,24 @@ def cleanup():
 
 
 def prepare_repo(repo_name, revision="main", safetensor_path=None):
+    """
+    Prepares and loads various models and tokenizers from pretrained repositories.
+
+    Args:
+        repo_name (str): The name of the repository to load the transformer model from.
+        revision (str, optional): The specific revision of the models to load. Defaults to "main".
+        safetensor_path (str, optional): Path to a safetensor file to load the transformer state dict from. Defaults to None.
+
+    Returns:
+        tuple: A tuple containing the following elements:
+            - scheduler: The loaded FlowMatchEulerDiscreteScheduler.
+            - text_encoder: The loaded CLIPTextModel.
+            - tokenizer: The loaded CLIPTokenizer.
+            - text_encoder_2: The loaded T5EncoderModel.
+            - tokenizer_2: The loaded T5TokenizerFast.
+            - vae: The loaded AutoencoderKL.
+            - transformer: The loaded FluxTransformer2DModel.
+    """
     with torch.device("cpu"):
         text_encoder = CLIPTextModel.from_pretrained("openai/clip-vit-large-patch14", torch_dtype=dtype)
         text_encoder_2 = T5EncoderModel.from_pretrained(bfl_repo, subfolder="text_encoder_2", torch_dtype=dtype, revision=revision)
@@ -90,11 +109,26 @@ def prepare_repo(repo_name, revision="main", safetensor_path=None):
         transformer.eval()
     vae = AutoencoderKL.from_pretrained(bfl_repo, subfolder="vae", torch_dtype=dtype, revision=revision).to(device)
     scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(bfl_repo, subfolder="scheduler", revision=revision)
-
     return scheduler, text_encoder, tokenizer, text_encoder_2, tokenizer_2, vae, transformer
 
+def generate_docker_name():
+        fake = Faker()
+        return f"{fake.word().lower()}_{fake.word().lower()}" 
 
 def miaoshuai_tagger(image):
+    """
+    Generates a detailed caption for the given image using a pre-trained model.
+    Args:
+        image (PIL.Image or torch.Tensor): The input image for which the caption is to be generated.
+    Returns:
+        str: The generated detailed caption for the input image.
+    Notes:
+        - The function uses the "MiaoshouAI/Florence-2-large-PromptGen-v2.0" model and processor.
+        - The model and processor are loaded with `trust_remote_code=True`.
+        - The prompt used for generating the caption is "<MORE_DETAILED_CAPTION>".
+        - The function processes the input image and prompt, generates the caption, and post-processes the generated text.
+        - The result is printed and returned as a string.
+    """
     # Use AutoModelForCausalLM instead of directly loading the model class
     model = AutoModelForCausalLM.from_pretrained(
         "MiaoshouAI/Florence-2-large-PromptGen-v2.0", 
@@ -152,7 +186,18 @@ def apply_loras(lorafile, pipe):
 
 
 def setup_pipeline(mode, acceleration, lora_file, safetensor_path=None):
-    """Set up and configure the appropriate pipeline based on parameters."""
+    """
+    Sets up the pipeline for various modes and applies optimizations.
+    Args:
+        mode (str): The mode of the pipeline. Options are "depth", "redux", "refiner", "rejoy", or other.
+        acceleration (str): The type of acceleration to apply. Options are "hyper" or "alimama".
+        lora_file (str): Path to the LoRA file to apply.
+        safetensor_path (str, optional): Path to the safetensor file. Defaults to None.
+    Returns:
+        tuple: A tuple containing the main pipeline and the prior redux pipeline (if applicable).
+    Raises:
+        RuntimeError: If there is an error during LoRA application or loading acceleration adapters.
+    """
     pipe_prior_redux = None
 
     # Aggressive memory cleanup
@@ -287,19 +332,20 @@ def setup_pipeline(mode, acceleration, lora_file, safetensor_path=None):
 
 def prepare_image(input_path, scale_down=False):
     """
-    Prepare the input image with appropriate scaling.
-    Parameters:
-    input_path (str): The file path to the input image.
-    scale_down (bool): Flag to indicate whether to scale down the image if it exceeds a certain size. Default is False.
+    Prepares an image for further processing by optionally scaling it down and ensuring it meets 
+    certain size criteria.
+    Args:
+        input_path (str): The file path to the input image.
+        scale_down (bool, optional): If True, the image will be scaled down if it exceeds a certain 
+                                     pixel count. Defaults to False.
     Returns:
-    tuple: A tuple containing the processed image, its width, and its height.
-    The function performs the following steps:
-    1. Loads the image from the given input path.
-    2. If scale_down is True, checks the image size and scales it down if it exceeds 1.5 million pixels.
-    3. Ensures the image is at least 1 million pixels by scaling it up if necessary.
-    4. Returns the processed image along with its width and height.
+        tuple: A tuple containing the processed image, its width, and its height.
+    Notes:
+        - If `scale_down` is True and the image has more than 1.5 million pixels, it will be scaled 
+          down using the `upscale_to_sdxl` function.
+        - If the image has fewer than 1 million pixels, it will be scaled up to the nearest SDXL 
+          resolution using the `upscale_to_sdxl` function.
     """
-    """Prepare the input image with appropriate scaling."""
     init_image = load_image(input_path)
     fname = os.path.basename(input_path)
     
@@ -346,24 +392,32 @@ def warmup_pipeline(pipe, pipe_prior_redux, mode):
 
 def process_single_image(input_path, output_path, pipe, pipe_prior_redux, prompt, mode, acceleration, strength, scale_down, cfg, steps):
     """
-    Process a single image with the configured pipeline.
+    Processes a single image using the specified pipeline and parameters.
     Args:
         input_path (str): Path to the input image.
         output_path (str): Path to save the processed image.
-        pipe (Pipeline): The main image processing pipeline.
-        pipe_prior_redux (Pipeline): The pipeline used for redux processing.
-        prompt (str): The prompt for image generation.
-        redux (bool): Flag to indicate if redux processing should be used.
-        acceleration (str): Type of acceleration to be used ('alimama', 'hyper', etc.).
-        strength (float): Strength parameter for img2img processing.
-        scale_down (float): Factor to scale down the input image.
+        pipe (Pipeline): The main pipeline used for image processing.
+        pipe_prior_redux (Pipeline): The pipeline used for prior reduction in 'redux' mode.
+        prompt (str): The prompt to guide the image generation. If "auto", it will be generated automatically.
+        mode (str): The mode of processing. Options are "refiner", "redux", "rejoy", or others.
+        acceleration (str): The acceleration mode. Options are "alimama", "hyper", or others.
+        strength (float): The strength of the effect applied to the image.
+        scale_down (float): The factor by which to scale down the image.
+        cfg (float): The guidance scale for the pipeline.
+        steps (int): The number of steps for the inference process.
     Returns:
-        bool: True if processing was successful, False otherwise.
+        bool: True if the image was processed successfully, False otherwise.
     """
     try:
         # Prepare the image
         init_image, width, height = prepare_image(input_path, scale_down)
         fname = os.path.basename(input_path)
+        
+        # If output_path already has a random name (from process_directory), use it
+        # Otherwise use the base name from input
+        if not output_path.endswith('.png'):  # Indicates it wasn't pre-set with random name
+            base_name = os.path.splitext(fname)[0]
+            output_path = os.path.join(os.path.dirname(output_path), f"{base_name}.png")
         
         def callback(pipe, step, timestep, callback_kwargs):
             latents = callback_kwargs.get("latents", None)
@@ -371,25 +425,21 @@ def process_single_image(input_path, output_path, pipe, pipe_prior_redux, prompt
             return {"latents": latents} if latents is not None else {}
         
         # Set the timesteps and strength for the inference
-        if mode == "redux" or mode == "depth":
-            # Redux always uses strength 1.0
-            effective_strength = 1.0
-        else:
-            # Use the provided strength parameter for img2img
+        if mode == "refiner":
             effective_strength = strength
+        else:
+            effective_strength = 1.0
             
         if acceleration in ["alimama", "hyper"]:
             desired_num_steps = 10
         else:
             desired_num_steps = steps
 
-        # Calculate inference steps based on strength
         num_inference_steps = desired_num_steps / effective_strength
 
         if prompt == "auto":
             prompt = miaoshuai_tagger(init_image)
 
-        # Detailer Daemon
         pipe.scheduler.set_sigmas = LyingSigmaSampler(
             dishonesty_factor=-0.05,
             start_percent=0.1,
@@ -454,100 +504,101 @@ def process_single_image(input_path, output_path, pipe, pipe_prior_redux, prompt
                         callback_on_step_end=callback
                     ).images                 
 
-            # Saving images with appropriate filenames
+            # Saving images with appropriate filenames (always PNG)
             if len(result) > 1:
-                # If multiple images, add suffixes
                 for idx, img in enumerate(result):
-                    output_image_path = f"{output_path.rstrip('.png')}_{str(idx + 1).zfill(4)}.png"
-                    img.save(output_image_path)
+                    multi_output_path = f"{output_path.rstrip('.png')}_{str(idx + 1).zfill(4)}.png"
+                    img.save(multi_output_path)
             else:
-                # If only one image, save normally
                 result[0].save(output_path)
-                
+
         return True
     except Exception as e:
         print(f"Error processing {os.path.basename(input_path)}: {e}")
         return False
+    
 
-def get_files_to_process(input_dir, output_dir):
+def get_files_to_process(input_dir, output_dir, random_names=False):
     """
-    Get the list of PNG files that need to be processed from the input directory.
-    This function checks whether the input path is a file or a directory. If it is a file,
-    it extracts the directory and filename separately. If it is a directory, it retrieves
-    all PNG files within it. The function then compares the list of PNG files with the
-    output directory to determine which files need to be processed (i.e., files that do
-    not already exist in the output directory).
-    Args:
-        input_dir (str): The path to the input directory or file.
-        output_dir (str): The path to the output directory.
+    Get a list of files to process from the input directory or file.
+    Parameters:
+    input_dir (str): Path to the input directory or file.
+    output_dir (str): Path to the output directory.
+    random_names (bool): If True, process all files and use random names for output. Default is False.
     Returns:
-        tuple: A tuple containing the input directory path and a list of files to process.
+    tuple: A tuple containing the input directory path and a list of files to process.
     Raises:
-        ValueError: If the input path is neither a file nor a directory.
+    ValueError: If the input is neither a file nor a directory.
+    Notes:
+    - If `input_dir` is a file, only that file will be processed.
+    - If `input_dir` is a directory, all files with valid extensions ('.png', '.jpg', '.jpeg', '.webp') will be considered.
+    - If `random_names` is False, files that already exist in the output directory will be skipped.
+    - If `random_names` is True, all files will be processed regardless of existing files in the output directory.
     """
-    # Check if input_dir is a file or directory
     if os.path.isfile(input_dir):
-        # If input_dir is a file, extract its directory and filename separately
         input_dir_path, filename = os.path.split(input_dir)
-        png_files = [filename]  # Store only the filename
-        input_dir = input_dir_path  # Update input_dir to be the directory
+        files = [filename]
+        input_dir = input_dir_path
     elif os.path.isdir(input_dir):
-        # If input_dir is a directory, get all image files with supported extensions
         valid_extensions = ('.png', '.jpg', '.jpeg', '.webp')
-        png_files = sorted([f for f in os.listdir(input_dir) 
-                        if f.lower().endswith(valid_extensions)])
+        files = sorted([f for f in os.listdir(input_dir) 
+                       if f.lower().endswith(valid_extensions)])
     else:
         raise ValueError("Input must be either a file or a directory.")
 
-    # Create a list of files that need processing, excluding already processed files
     files_to_process = []
     print(f"Output directory: {output_dir}")
 
-    for f in png_files:
-        filename = os.path.basename(f)  # Extract only the filename
-        output_path = os.path.join(output_dir, filename)  # Output path is based on the filename
-        print(f"Output path: {output_path}")
-        if not os.path.exists(output_path):
-            files_to_process.append(f)  # Only add files that don't exist in the output directory
-        else:
-            print(f"Skipping {f}: already exists in output directory.")
+    if not random_names:
+        for f in files:
+            base_name = os.path.splitext(f)[0]
+            output_path = os.path.join(output_dir, f"{base_name}.png")
+            
+            if not os.path.exists(output_path):
+                files_to_process.append(f)
+            else:
+                print(f"Skipping {f}: {base_name}.png already exists in output directory.")
+    else:
+        # When using random names, process all files since names will be unique
+        files_to_process = files
+        print("Using random names - processing all files")
 
-    # Debug: print the number of files that need processing
     print(f"Total files to process: {len(files_to_process)}")
-
     return input_dir, files_to_process
 
 
-def process_directory(input_dir, output_dir, acceleration, prompt, safetensor_path=None, lora_file=None, scale_down=False, strength=0.20, mode="refiner", cfg=3.0, steps=25):
+def process_directory(input_dir, output_dir, acceleration, prompt, safetensor_path=None, lora_file=None, scale_down=False, strength=0.20, mode="refiner", cfg=3.0, steps=25, random_names=False):
     """
-    Process all images in a directory with the specified parameters.
+    Processes all images in the input directory using the specified pipeline and saves the results to the output directory.
     Args:
-        input_dir (str): The directory containing input images.
-        output_dir (str): The directory where processed images will be saved.
-        acceleration (bool): Flag to enable or disable acceleration.
-        redux (bool): Flag to enable or disable redux mode.
-        prompt (str): The prompt to be used for processing images.
-        fp8 (bool): Flag to enable or disable FP8 precision.
-        lora_file (str): Path to the LoRA file to be used.
-        scale_down (bool, optional): Flag to enable or disable scaling down of images. Defaults to False.
-        strength (float, optional): The strength of the processing effect. Defaults to 0.20.
+        input_dir (str): Path to the directory containing input images.
+        output_dir (str): Path to the directory where processed images will be saved.
+        acceleration (bool): Flag to enable acceleration in the pipeline.
+        prompt (str): Text prompt to guide the image processing.
+        safetensor_path (str, optional): Path to the safetensor file. Defaults to None.
+        lora_file (str, optional): Path to the LoRA file. Defaults to None.
+        scale_down (bool, optional): Flag to enable scaling down of images. Defaults to False.
+        strength (float, optional): Strength of the processing effect. Defaults to 0.20.
+        mode (str, optional): Mode of the pipeline. Defaults to "refiner".
+        cfg (float, optional): Configuration parameter for the pipeline. Defaults to 3.0.
+        steps (int, optional): Number of steps for the processing. Defaults to 25.
+        random_names (bool, optional): Flag to enable random naming of output files. Defaults to False.
     Returns:
         None
     """
     os.makedirs(output_dir, exist_ok=True)
     
-    # Setup the pipeline with safetensor_path
     pipe, pipe_prior_redux = setup_pipeline(mode, acceleration, lora_file, safetensor_path)
     
     print("Warming up pipeline...")
     warmup_pipeline(pipe, pipe_prior_redux, mode)
     
-    input_dir, files_to_process = get_files_to_process(input_dir, output_dir)
+    input_dir, files_to_process = get_files_to_process(input_dir, output_dir, random_names)
     
     with tqdm(total=len(files_to_process), desc="Processing images", unit="img") as main_pbar:
         for filename in files_to_process:
             input_path = os.path.join(input_dir, filename)
-            output_path = os.path.join(output_dir, filename)
+            output_path = os.path.join(output_dir, filename if not random_names else generate_docker_name() + ".png")
             
             success = process_single_image(
                 input_path, 
@@ -631,7 +682,7 @@ def main():
     parser.add_argument('--acceleration', '-a', type=str,
                         choices=['alimama', 'hyper', 'none'],
                         default='none',
-                        help='Acceleration LORA. Available options are Alimama Turbo or ByteDance Hyper (alimama|hyper) with 10 steps. If not provided, flux with 25 steps will be used.')
+                        help='Acceleration LORA. Available options are Alimama Turbo or ByteDance Hyper (alimama|hyper) with 10 steps.')
     
     parser.add_argument('--prompt', '-p', type=str,
                     default='Very detailed, masterpiece quality',
@@ -661,10 +712,13 @@ def main():
 
     parser.add_argument('--steps', '-e', type=int,
                         default=25,  # Add default value
-                        help="Number of steps for processing")         
+                        help="Number of steps for processing. If not provided and accelerator is not set, flux with 25 steps will be used.")         
 
     parser.add_argument('--output_dir', '-o', type=str,
                        help='Optional output directory. If not provided, outputs will be placed in current directory.')
+    
+    parser.add_argument('--random-names', '-r', action='store_true',
+                            help="Override default naming behavior and use random docker-style names for output files")    
 
     args = parser.parse_args()
 
@@ -679,8 +733,11 @@ def main():
 
     print(f"Output directory: {out_dir}")
     print(f"Mode of Operation: {args.mode}")
+    print(f"Using random names: {args.random_names}")
 
-    process_directory(args.path, out_dir, args.acceleration, args.prompt, args.safetensor, args.lora, args.scale_down, args.denoise, args.mode, args.cfg, args.steps)
+    process_directory(args.path, out_dir, args.acceleration, args.prompt, args.safetensor, 
+                     args.lora, args.scale_down, args.denoise, args.mode, args.cfg, args.steps, 
+                     args.random_names)
 
 if __name__ == "__main__":
     main()
