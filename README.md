@@ -36,7 +36,7 @@
   - [Arguments](#arguments)
   - [Options](#options)
   - [Examples](#examples)
-- [Processing Details](#processing-details)
+- [Processing Modes](#processing-modes)
 - [Image Preparation](#image-preparation)
 - [Memory Optimization](#memory-optimization)
 - [Error Handling](#error-handling)
@@ -52,7 +52,9 @@ TengraiRefiner is a Python script for batch processing images using FLUX models 
 ## Features
 
 - Support for both single image and batch processing
-- Compatible with FLUX.1-dev and FLUX.1-Redux-dev models
+- Multiple processing modes: Refiner, Redux, Depth, and ReJoy
+- Automatic image captioning with MiaoshouAI's Florence-2 model
+- Compatible with FLUX.1-dev, FLUX.1-Redux-dev, and FLUX.1-Depth-dev models
 - Intelligent image scaling to SDXL-compatible resolutions
 - Memory-efficient processing with automatic CPU offloading
 - FP8 quantization support for optimal performance
@@ -61,6 +63,9 @@ TengraiRefiner is a Python script for batch processing images using FLUX models 
 - Custom LoRA support with ability to apply before acceleration
 - Adjustable denoise strength for refiner processing
 - Option to scale down large images for more efficient processing
+- CFG guidance scale adjustment
+- Control over number of inference steps
+- Option for random output filenames
 
 ## Prerequisites
 
@@ -76,6 +81,7 @@ Pillow>=10.0.0
 tqdm>=4.66.0
 huggingface-hub>=0.19.0
 optimum-quanto
+faker
 multiformats
 xformers>=0.0.25
 ```
@@ -98,18 +104,21 @@ python script.py <path> [options]
 
 ### Arguments
 
-- `path`: Required. Path to input file or directory containing PNG files to process
+- `path`: Required. Path to input file or directory containing image files to process
 
 ### Options
 
 - `-a, --acceleration`: Choose acceleration LORA (options: 'alimama', 'hyper', or 'none', default: 'none')
-- `-p, --prompt`: Set a custom prompt (default: 'Very detailed, masterpiece quality')
-- `-r, --redux`: Use redux instead of img2img
-- `-q, --load-fp8`: Use a local FP8 quantized transformer model
-- `-s, --scale-down`: Scale down the source image by 50% if above 1.5 megapixels
+- `-p, --prompt`: Set a custom prompt (default: 'Very detailed, masterpiece quality') or use 'auto' for automatic captioning
+- `-m, --mode`: Set mode of operation (options: 'refiner', 'redux', 'depth', 'rejoy', default: 'refiner')
+- `-t, --safetensor`: Path to a Flux safetensor file to load transformer weights
+- `-s, --scale-down`: Scale down the source image if above 1.5 megapixels
 - `-l, --lora`: Path to a LoRA file to apply before acceleration
 - `-d, --denoise`: Denoise strength for refine processing (default: 0.20)
+- `-c, --cfg`: CFG strength for processing (default: 3.0)
+- `-e, --steps`: Number of steps for processing (default: 25)
 - `-o, --output_dir`: Specify output directory
+- `-r, --random-names`: Use random docker-style names for output files
 
 ### Examples
 
@@ -123,29 +132,31 @@ python script.py <path> [options]
    python script.py path/to/directory -a hyper
    ```
 
-3. Process images with a custom prompt and specific output directory:
+3. Process images with automatic captioning and specific output directory:
    ```bash
-   python script.py path/to/directory -p "high quality, detailed" -o output/folder
+   python script.py path/to/directory -p auto -o output/folder
    ```
 
-4. Use redux processing with Alimama acceleration:
+4. Use depth mode with Alimama acceleration:
    ```bash
-   python script.py path/to/directory -r -a alimama
+   python script.py path/to/directory -m depth -a alimama
    ```
 
-5. Apply a custom LoRA and set denoise strength:
+5. Apply a custom LoRA and set denoise strength with random output names:
    ```bash
-   python script.py path/to/directory -l path/to/lora.safetensors -d 0.30
+   python script.py path/to/directory -l path/to/lora.safetensors -d 0.30 -r
    ```
 
-## Processing Details
+## Processing Modes
 
-- Images are processed one at a time with comprehensive progress tracking
-- Default processing uses 25 inference steps (10 steps with acceleration)
-- Strength parameter is configurable via the `-d/--denoise` option (defaults to 0.20 for img2img and always 1.0 for redux)
-- Already processed images are skipped to avoid duplication
-- Custom LyingSigmaSampler for improved detail enhancement
-- Output maintains original image dimensions
+TengraiRefiner supports multiple processing modes:
+
+- **Refiner (default)**: Image-to-image refinement with adjustable strength
+- **Redux**: Uses FLUX.1-Redux-dev model for specialized processing
+- **Depth**: Generates depth map from input image and uses it for control
+- **ReJoy**: Text-to-image generation mode that uses the input image resolution
+
+Each mode has specific advantages for different use cases. When using acceleration (Alimama or Hyper), steps are automatically reduced to 10 for optimal performance.
 
 ## Image Preparation
 
@@ -162,12 +173,14 @@ The script includes several optimizations:
 - BFloat16 precision by default
 - Automatic CPU offloading for components not actively in use
 - Transformer quantization via optimum-quanto for reduced VRAM usage
-- Option to load pre-quantized FP8 transformer models
+- Option to load pre-quantized transformer models via safetensors
 - Model freezing for reduced memory footprint
+- VAE tiling and slicing for large images
+- Attention slicing for better memory efficiency
 
 ## Error Handling
 
-- Skips already processed images
+- Skips already processed images unless random names are used
 - Provides detailed error messages for failed processing attempts
 - Validates input paths and arguments
 - Continues processing remaining images if one fails
@@ -178,8 +191,9 @@ The script includes several optimizations:
 - Requires CUDA-capable GPU for optimal performance
 - Progress bars show both overall batch progress and per-image step progress
 - Environment variables can be configured via .env file
-- Original file names are preserved in output
+- Original file names are preserved in output unless random naming is enabled
 - For very large images, consider using the `-s/--scale-down` option
+- Supports processing images in PNG, JPG, JPEG, and WEBP formats
 
 ---
 ## Project Roadmap
@@ -188,8 +202,11 @@ The script includes several optimizations:
 - [X] **`Task 2`**: <strike>Add support for custom LoRA files</strike>
 - [X] **`Task 3`**: <strike>Implement intelligent image scaling for optimal processing</strike>
 - [X] **`Task 4`**: <strike>Add FP8 quantization support</strike>
-- [ ] **`Task 5`**: Implement memory optimization for Redux
-- [ ] **`Task 6`**: Add batch size control for more efficient processing
+- [X] **`Task 5`**: <strike>Add Depth and ReJoy processing modes</strike>
+- [X] **`Task 6`**: <strike>Implement automatic image captioning</strike>
+- [X] **`Task 7`**: <strike>Add random output file naming option</strike>
+- [ ] **`Task 8`**: Implement memory optimization for Redux
+- [ ] **`Task 9`**: Add batch size control for more efficient processing
 
 ---
 
@@ -247,6 +264,7 @@ This project is protected under the [GNU GPLv3](https://choosealicense.com/licen
 - [Black Forest Labs](https://flux.dev) for the FLUX.1 models
 - [Alimama Creative](https://huggingface.co/alimama-creative) for the FLUX.1-Turbo adapter
 - [ByteDance](https://huggingface.co/ByteDance) for the Hyper-SD acceleration adapter
+- [MiaoshouAI](https://huggingface.co/MiaoshouAI) for the Florence-2 image captioning model
 - [Tengrai AI](https://www.tengrai.ai) for the inspiration behind this refiner
 
 ---

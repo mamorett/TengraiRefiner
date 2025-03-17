@@ -23,8 +23,6 @@ from safetensors.torch import load_file
 from faker import Faker
 
 
-load_dotenv()
-
 # Enable memory-efficient attention for SD-based models
 torch.backends.cuda.enable_mem_efficient_sdp(True)
 dtype = torch.bfloat16
