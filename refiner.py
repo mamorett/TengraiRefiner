@@ -40,6 +40,18 @@ torch.backends.cudnn.allow_tf32 = True
 
 
 class LyingSigmaSampler:
+    """
+    A class to modify the sigma values during model sampling by applying a dishonesty factor.
+
+    Attributes:
+        dishonesty_factor (float): The factor by which to modify the sigma values. Default is -0.05.
+        start_percent (float): The starting percentage of the sigma range. Default is 0.1.
+        end_percent (float): The ending percentage of the sigma range. Default is 0.9.
+
+    Methods:
+        __call__(model, x, sigmas, **kwargs):
+            Modifies the sigma values during model sampling based on the dishonesty factor.
+    """
     def __init__(self, 
                  dishonesty_factor: float = -0.05, 
                  start_percent: float = 0.1, 
@@ -164,6 +176,21 @@ def miaoshuai_tagger(image):
 
 
 def apply_loras(lorafile, pipe):
+    """
+    Apply a LoRA (Low-Rank Adaptation) to the given pipeline.
+
+    This function loads and applies a LoRA from the specified file to the provided pipeline.
+    The LoRA weights are loaded onto the GPU, applied, and then unloaded to free up resources.
+    If the LoRA application fails, the function will print an error message and continue with the next LoRA.
+
+    Args:
+        lorafile (str): The file path to the LoRA file. If None or empty, the function returns the original pipeline.
+        pipe (object): The pipeline object to which the LoRA will be applied. This object must have methods 
+                       `load_lora_weights`, `fuse_lora`, and `unload_lora_weights`.
+
+    Returns:
+        object: The pipeline object with the applied LoRA.
+    """
     if not lorafile:
         return pipe
 
